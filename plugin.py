@@ -399,6 +399,19 @@ def _build_parameters(prompt, width, height, steps, scale, sampler, model, negat
     return params
 
 
+def _strip_png_metadata(data: bytes) -> bytes:
+    try:
+        from PIL import Image as PILImage
+        img = PILImage.open(io.BytesIO(data))
+        clean = PILImage.new(img.mode, img.size)
+        clean.putdata(list(img.getdata()))
+        buf = io.BytesIO()
+        clean.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return data
+
+
 def _extract_image(response_data: bytes) -> Optional[bytes]:
     try:
         from PIL import Image as PILImage
@@ -583,7 +596,7 @@ async def _forward_result(ctx: AgentCtx, image_data: bytes, fmt: str = "png") ->
     shared_root.mkdir(parents=True, exist_ok=True)
     filename = f"novelai_{random.randint(100000, 999999)}.{fmt}"
     file_path = shared_root / filename
-    file_path.write_bytes(image_data)
+    file_path.write_bytes(_strip_png_metadata(image_data))
     send_path = ctx.fs.forward_file(file_path)
     if asyncio.iscoroutine(send_path) or asyncio.isfuture(send_path):
         send_path = await send_path
@@ -661,10 +674,12 @@ async def cmd_draw(
         save_dir.mkdir(parents=True, exist_ok=True)
         file_name = f"nai_{int(_time.time())}.png"
         file_path = save_dir / file_name
-        file_path.write_bytes(image_data)
+        file_path.write_bytes(_strip_png_metadata(image_data))
         abs_path = str(file_path.resolve())
+        raw_path = save_dir / f"raw_{file_name}"
+        raw_path.write_bytes(image_data)
         chat_key = getattr(context, "chat_key", "") or ""
-        _last_draw[chat_key] = {"prompt": prompt, "width": width, "height": height}
+        _last_draw[chat_key] = {"prompt": prompt, "width": width, "height": height, "image_path": str(raw_path.resolve())}
         yield CmdCtl.success([
             CommandOutputSegment(type=CommandOutputSegmentType.TEXT, text="NovelAI 画图完成"),
             CommandOutputSegment(type=CommandOutputSegmentType.IMAGE, file_path=abs_path),
@@ -707,7 +722,7 @@ async def cmd_redraw(
         save_dir.mkdir(parents=True, exist_ok=True)
         file_name = f"nai_{int(_time.time())}.png"
         file_path = save_dir / file_name
-        file_path.write_bytes(image_data)
+        file_path.write_bytes(_strip_png_metadata(image_data))
         abs_path = str(file_path.resolve())
         raw_path = save_dir / f"raw_{file_name}"
         raw_path.write_bytes(image_data)
@@ -864,18 +879,29 @@ async def cmd_metadata(
                         if rt == "image":
                             image_url = rd.get("url") or rd.get("file")
                             break
-    if not image_url:
-        yield CmdCtl.failed("请回复一张图片来提取参数。")
-        return
-    yield CmdCtl.message("正在提取图片参数...")
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(image_url)
-            resp.raise_for_status()
-            img_bytes = resp.content
-    except Exception as exc:
-        yield CmdCtl.failed(f"下载图片失败: {exc}")
-        return
+    img_bytes = None
+    if image_url:
+        yield CmdCtl.message("正在提取图片参数...")
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(image_url)
+                resp.raise_for_status()
+                img_bytes = resp.content
+        except Exception as exc:
+            yield CmdCtl.failed(f"下载图片失败: {exc}")
+            return
+    else:
+        chat_key = getattr(context, "chat_key", "") or ""
+        last = _last_draw.get(chat_key)
+        if last and last.get("image_path"):
+            try:
+                img_bytes = Path(last["image_path"]).read_bytes()
+                yield CmdCtl.message("正在提取上一张画图的参数...")
+            except FileNotFoundError:
+                pass
+        if img_bytes is None:
+            yield CmdCtl.failed("请回复一张图片，或在画图后直接使用本命令查看参数。")
+            return
     metadata = _extract_png_metadata(img_bytes)
     if not metadata:
         yield CmdCtl.failed("未能从该图片中提取到 NovelAI 元数据。可能不是 NAI 生成的图片。")
