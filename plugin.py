@@ -35,7 +35,9 @@ from nekro_agent.api.schemas import AgentCtx
 from nekro_agent.core import logger
 
 
-plugin = NekroPlugin(
+import inspect as _inspect
+
+_plugin_kwargs: dict = dict(
     name="NovelAI 画图",
     module_name="novelai",
     description="NovelAI 文生图/图生图插件，支持 NAI v3/v4/v4.5/v5 模型。",
@@ -51,6 +53,9 @@ plugin = NekroPlugin(
     allow_sleep=True,
     sleep_brief="提供 NovelAI 文生图、图生图能力。仅在用户明确要求画图、生成图片时激活。",
 )
+_init_sig = _inspect.signature(NekroPlugin.__init__)
+_plugin_kwargs = {k: v for k, v in _plugin_kwargs.items() if k in _init_sig.parameters}
+plugin = NekroPlugin(**_plugin_kwargs)
 
 NAI_API_BASE = "https://image.novelai.net"
 
