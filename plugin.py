@@ -232,6 +232,21 @@ class PresetStore:
             self._data[kind][name] = prompt
             self._save()
 
+    def set_many(self, kind: str, items: dict) -> int:
+        kind = self._check_kind(kind)
+        count = 0
+        with self._lock:
+            for name, prompt in items.items():
+                try:
+                    clean_name, clean_prompt = self._check_values(str(name), str(prompt))
+                except ValueError:
+                    continue
+                self._data[kind][clean_name] = clean_prompt
+                count += 1
+            if count:
+                self._save()
+        return count
+
     def delete(self, kind: str, name: str) -> bool:
         kind = self._check_kind(kind)
         with self._lock:
@@ -407,11 +422,10 @@ def _build_parameters(prompt, width, height, steps, scale, sampler, model, negat
 def _strip_png_metadata(data: bytes) -> bytes:
     try:
         from PIL import Image as PILImage
-        img = PILImage.open(io.BytesIO(data))
-        clean = PILImage.new(img.mode, img.size)
-        clean.putdata(list(img.getdata()))
-        buf = io.BytesIO()
-        clean.save(buf, format="PNG")
+        with PILImage.open(io.BytesIO(data)) as img:
+            img.info.clear()
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
         return buf.getvalue()
     except Exception:
         return data
@@ -442,7 +456,7 @@ def _extract_image(response_data: bytes) -> Optional[bytes]:
             return base64.b64decode(data["image"])
     except Exception:
         pass
-    return response_data
+    return None
 
 
 def _has_chinese(text: str) -> bool:
@@ -599,13 +613,43 @@ async def _call_img2img(prompt, image_b64, width=0, height=0, steps=0, scale=0, 
 async def _forward_result(ctx: AgentCtx, image_data: bytes, fmt: str = "png") -> str:
     shared_root = Path(ctx.fs.shared_path).resolve()
     shared_root.mkdir(parents=True, exist_ok=True)
-    filename = f"novelai_{random.randint(100000, 999999)}.{fmt}"
+    filename = f"novelai_{int(_time.time())}_{random.randint(1000, 9999)}.{fmt}"
     file_path = shared_root / filename
     file_path.write_bytes(_strip_png_metadata(image_data))
     send_path = ctx.fs.forward_file(file_path)
     if asyncio.iscoroutine(send_path) or asyncio.isfuture(send_path):
         send_path = await send_path
     return str(send_path)
+
+
+def _chat_key_of(context) -> str:
+    return getattr(context, "chat_key", None) or getattr(context, "channel_id", None) or "default"
+
+
+def _cleanup_generated(save_dir: Path, max_age: float = 86400) -> None:
+    try:
+        cutoff = _time.time() - max_age
+        for entry in save_dir.iterdir():
+            try:
+                if entry.is_file() and entry.stat().st_mtime < cutoff:
+                    entry.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _save_generated(image_data: bytes, chat_key: str, prompt: str, width: int, height: int) -> str:
+    save_dir = plugin.get_plugin_data_dir() / "generated"
+    save_dir.mkdir(parents=True, exist_ok=True)
+    _cleanup_generated(save_dir)
+    file_name = f"nai_{int(_time.time())}_{random.randint(100, 999)}.png"
+    file_path = save_dir / file_name
+    file_path.write_bytes(_strip_png_metadata(image_data))
+    raw_path = save_dir / f"raw_{file_name}"
+    raw_path.write_bytes(image_data)
+    _last_draw[chat_key] = {"prompt": prompt, "width": width, "height": height, "image_path": str(raw_path.resolve())}
+    return str(file_path.resolve())
 
 
 RATIO_PRESETS = {
@@ -661,7 +705,7 @@ async def cmd_draw(
     context: CommandExecutionContext,
     prompt: Annotated[str, Arg("画图提示词", positional=True, greedy=True)] = "",
 ) -> AsyncIterator[CommandResponse]:
-    """使用 NovelAI 生成图片。支持中文描述（自动翻译）和英文 danbooru 标签。支持 -w宽 -h高 -r比例 或 WxH 尺寸参数。"""
+    """使用 NovelAI 生成图片。支持中文描述（自动翻译）、英文 danbooru 标签、预设引用（@人物/#风格/裸名）。末尾加「竖/方/横」指定尺寸。"""
     if not prompt.strip():
         yield CmdCtl.failed("请提供画图提示词，例如: /nai 一个穿白裙子的少女站在花田里\n加「竖」「方」「横」可指定尺寸")
         return
@@ -675,16 +719,7 @@ async def cmd_draw(
         yield CmdCtl.failed(f"NovelAI 画图失败: {exc}")
         return
     try:
-        save_dir = plugin.get_plugin_data_dir() / "generated"
-        save_dir.mkdir(parents=True, exist_ok=True)
-        file_name = f"nai_{int(_time.time())}.png"
-        file_path = save_dir / file_name
-        file_path.write_bytes(_strip_png_metadata(image_data))
-        abs_path = str(file_path.resolve())
-        raw_path = save_dir / f"raw_{file_name}"
-        raw_path.write_bytes(image_data)
-        chat_key = getattr(context, "chat_key", "") or ""
-        _last_draw[chat_key] = {"prompt": prompt, "width": width, "height": height, "image_path": str(raw_path.resolve())}
+        abs_path = _save_generated(image_data, _chat_key_of(context), prompt, width, height)
         yield CmdCtl.success([
             CommandOutputSegment(type=CommandOutputSegmentType.TEXT, text="NovelAI 画图完成"),
             CommandOutputSegment(type=CommandOutputSegmentType.IMAGE, file_path=abs_path),
@@ -705,7 +740,7 @@ async def cmd_redraw(
     context: CommandExecutionContext,
     extra: Annotated[str, Arg("追加描述", positional=True, greedy=True)] = "",
 ) -> AsyncIterator[CommandResponse]:
-    chat_key = getattr(context, "chat_key", "") or ""
+    chat_key = _chat_key_of(context)
     last = _last_draw.get(chat_key)
     if not last:
         yield CmdCtl.failed("还没有画过图，请先使用 /画图 命令。")
@@ -723,15 +758,7 @@ async def cmd_redraw(
         yield CmdCtl.failed(f"NovelAI 重画失败: {exc}")
         return
     try:
-        save_dir = plugin.get_plugin_data_dir() / "generated"
-        save_dir.mkdir(parents=True, exist_ok=True)
-        file_name = f"nai_{int(_time.time())}.png"
-        file_path = save_dir / file_name
-        file_path.write_bytes(_strip_png_metadata(image_data))
-        abs_path = str(file_path.resolve())
-        raw_path = save_dir / f"raw_{file_name}"
-        raw_path.write_bytes(image_data)
-        _last_draw[chat_key] = {"prompt": prompt, "width": width, "height": height, "image_path": str(raw_path.resolve())}
+        abs_path = _save_generated(image_data, chat_key, prompt, width, height)
         yield CmdCtl.success([
             CommandOutputSegment(type=CommandOutputSegmentType.TEXT, text="NovelAI 重画完成"),
             CommandOutputSegment(type=CommandOutputSegmentType.IMAGE, file_path=abs_path),
@@ -896,7 +923,7 @@ async def cmd_metadata(
             yield CmdCtl.failed(f"下载图片失败: {exc}")
             return
     else:
-        chat_key = getattr(context, "chat_key", "") or ""
+        chat_key = _chat_key_of(context)
         last = _last_draw.get(chat_key)
         if last and last.get("image_path"):
             try:
@@ -1245,19 +1272,16 @@ async function importPresets(event) {
   if (!file) return;
   try {
     const data = JSON.parse(await file.text());
-    const tasks = [];
-    for (const kind of ['characters', 'styles']) {
-      for (const [name, prompt] of Object.entries(data[kind] || {})) {
-        tasks.push(fetch('api/presets/' + kind, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name, prompt })
-        }));
-      }
-    }
-    if (!tasks.length) { toast('文件中没有可导入的预设', true); return; }
-    await Promise.all(tasks);
-    await loadPresets();
-    toast('导入完成：' + tasks.length + ' 个预设');
+    const r = await fetch('api/presets/import', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    const result = await r.json();
+    if (!r.ok) throw new Error(result.detail || '导入失败');
+    if (!result.imported) { toast('文件中没有可导入的预设', true); return; }
+    presets = { characters: result.characters, styles: result.styles };
+    updateCounts(); render();
+    toast('导入完成：' + result.imported + ' 个预设');
   } catch (e) { toast('导入失败: ' + e.message, true); }
 }
 document.addEventListener('keydown', (e) => {
@@ -1282,6 +1306,15 @@ def create_router() -> APIRouter:
     @router.get("/api/presets")
     async def api_get_presets() -> dict:
         return preset_store.all()
+
+    @router.post("/api/presets/import")
+    async def api_import_presets(payload: dict = Body(...)) -> dict:
+        imported = 0
+        for kind in ("characters", "styles"):
+            items = payload.get(kind)
+            if isinstance(items, dict):
+                imported += preset_store.set_many(kind, items)
+        return {"imported": imported, **preset_store.all()}
 
     @router.post("/api/presets/{kind}")
     async def api_save_preset(kind: str, payload: dict = Body(...)) -> dict:
