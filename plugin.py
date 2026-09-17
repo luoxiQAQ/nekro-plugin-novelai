@@ -399,19 +399,6 @@ def _build_parameters(prompt, width, height, steps, scale, sampler, model, negat
     return params
 
 
-def _strip_png_metadata(data: bytes) -> bytes:
-    try:
-        from PIL import Image as PILImage
-        img = PILImage.open(io.BytesIO(data))
-        clean = PILImage.new(img.mode, img.size)
-        clean.putdata(list(img.getdata()))
-        buf = io.BytesIO()
-        clean.save(buf, format="PNG")
-        return buf.getvalue()
-    except Exception:
-        return data
-
-
 def _extract_image(response_data: bytes) -> Optional[bytes]:
     try:
         from PIL import Image as PILImage
@@ -596,7 +583,7 @@ async def _forward_result(ctx: AgentCtx, image_data: bytes, fmt: str = "png") ->
     shared_root.mkdir(parents=True, exist_ok=True)
     filename = f"novelai_{random.randint(100000, 999999)}.{fmt}"
     file_path = shared_root / filename
-    file_path.write_bytes(_strip_png_metadata(image_data))
+    file_path.write_bytes(image_data)
     send_path = ctx.fs.forward_file(file_path)
     if asyncio.iscoroutine(send_path) or asyncio.isfuture(send_path):
         send_path = await send_path
@@ -674,7 +661,7 @@ async def cmd_draw(
         save_dir.mkdir(parents=True, exist_ok=True)
         file_name = f"nai_{int(_time.time())}.png"
         file_path = save_dir / file_name
-        file_path.write_bytes(_strip_png_metadata(image_data))
+        file_path.write_bytes(image_data)
         abs_path = str(file_path.resolve())
         chat_key = getattr(context, "chat_key", "") or ""
         _last_draw[chat_key] = {"prompt": prompt, "width": width, "height": height}
@@ -720,7 +707,7 @@ async def cmd_redraw(
         save_dir.mkdir(parents=True, exist_ok=True)
         file_name = f"nai_{int(_time.time())}.png"
         file_path = save_dir / file_name
-        file_path.write_bytes(_strip_png_metadata(image_data))
+        file_path.write_bytes(image_data)
         abs_path = str(file_path.resolve())
         raw_path = save_dir / f"raw_{file_name}"
         raw_path.write_bytes(image_data)
