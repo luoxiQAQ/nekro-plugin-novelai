@@ -999,84 +999,276 @@ PRESET_WEBUI_HTML = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NovelAI 预设管理</title>
 <style>
-:root { color-scheme: dark; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-body { margin: 0; padding: 24px; background: #111827; color: #e5e7eb; }
-main { max-width: 980px; margin: 0 auto; }
-h1 { margin: 0 0 8px; font-size: 28px; }
-.hint { color: #9ca3af; margin: 0 0 22px; }
-.tabs { display: flex; gap: 8px; margin-bottom: 16px; }
-button { border: 0; border-radius: 8px; padding: 9px 15px; cursor: pointer; color: #fff; background: #374151; font-size: 14px; }
-button.active, button.primary { background: #7c3aed; }
-button.danger { background: #b91c1c; }
-.panel { background: #1f2937; border: 1px solid #374151; border-radius: 12px; padding: 18px; }
-label { display: block; margin: 10px 0 6px; color: #d1d5db; }
-input, textarea { box-sizing: border-box; width: 100%; border: 1px solid #4b5563; border-radius: 8px; padding: 10px; background: #111827; color: #f9fafb; font: inherit; }
-textarea { min-height: 100px; resize: vertical; }
-.actions { display: flex; gap: 8px; margin-top: 14px; }
-.items { display: grid; gap: 10px; margin-top: 18px; }
-.item { border: 1px solid #374151; border-radius: 9px; padding: 12px; background: #182230; }
-.item-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.name { font-weight: 700; color: #c4b5fd; }
-.prompt { margin: 8px 0 0; color: #d1d5db; white-space: pre-wrap; word-break: break-word; }
-.item-actions { display: flex; gap: 6px; }
-#status { min-height: 22px; margin-top: 12px; color: #a7f3d0; }
-.empty { color: #9ca3af; padding: 10px 0; }
+* { box-sizing: border-box; }
+:root {
+  color-scheme: dark;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --bg: #0d1117; --bg2: #161b22; --bg3: #21262d;
+  --border: #30363d; --border-focus: #8b5cf6;
+  --text: #e6edf3; --text2: #9da7b3; --text3: #6e7681;
+  --accent: #8b5cf6; --accent2: #a78bfa; --accent-glow: rgba(139, 92, 246, 0.25);
+  --danger: #ef4444; --success: #34d399;
+}
+body { margin: 0; background: var(--bg); color: var(--text); min-height: 100vh;
+  background-image: radial-gradient(ellipse 80% 50% at 50% -20%, var(--accent-glow), transparent); }
+main { max-width: 1100px; margin: 0 auto; padding: 28px 20px 60px; }
+header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 14px; margin-bottom: 22px; }
+.title h1 { margin: 0; font-size: 26px; display: flex; align-items: center; gap: 10px; }
+.title h1 .logo { font-size: 30px; }
+.hint { color: var(--text2); margin: 6px 0 0; font-size: 13px; }
+.hint code { background: var(--bg3); padding: 2px 7px; border-radius: 5px; font-size: 12px; color: var(--accent2); }
+.toolbar { display: flex; gap: 8px; }
+.btn { border: 1px solid var(--border); border-radius: 9px; padding: 9px 16px; cursor: pointer;
+  color: var(--text); background: var(--bg3); font-size: 14px; transition: all .15s; font-family: inherit; }
+.btn:hover { border-color: var(--accent2); color: var(--accent2); }
+.btn.primary { background: linear-gradient(135deg, #7c3aed, #8b5cf6); border: 0; color: #fff; font-weight: 600;
+  box-shadow: 0 2px 12px var(--accent-glow); }
+.btn.primary:hover { transform: translateY(-1px); box-shadow: 0 4px 18px var(--accent-glow); }
+.btn.danger { color: var(--danger); }
+.btn.danger:hover { border-color: var(--danger); background: rgba(239,68,68,.1); color: var(--danger); }
+.btn.sm { padding: 6px 12px; font-size: 13px; border-radius: 7px; }
+.tabs { display: flex; gap: 10px; margin-bottom: 18px; }
+.tab { flex: 0 0 auto; border: 1px solid var(--border); border-radius: 10px; padding: 10px 20px;
+  cursor: pointer; background: var(--bg2); color: var(--text2); font-size: 14px; font-weight: 600;
+  transition: all .15s; font-family: inherit; }
+.tab .count { background: var(--bg3); border-radius: 20px; padding: 1px 9px; margin-left: 8px; font-size: 12px; }
+.tab.active { background: linear-gradient(135deg, #7c3aed, #8b5cf6); border-color: transparent; color: #fff;
+  box-shadow: 0 2px 14px var(--accent-glow); }
+.tab.active .count { background: rgba(255,255,255,.22); color: #fff; }
+.search-bar { display: flex; gap: 10px; margin-bottom: 20px; }
+.search-wrap { position: relative; flex: 1; }
+.search-wrap .icon { position: absolute; left: 13px; top: 50%; transform: translateY(-50%); color: var(--text3); font-size: 15px; }
+#search { width: 100%; padding: 11px 14px 11px 38px; border: 1px solid var(--border); border-radius: 10px;
+  background: var(--bg2); color: var(--text); font-size: 14px; font-family: inherit; outline: none; transition: border .15s; }
+#search:focus { border-color: var(--border-focus); box-shadow: 0 0 0 3px var(--accent-glow); }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
+.card { border: 1px solid var(--border); border-radius: 12px; padding: 15px 16px; background: var(--bg2);
+  transition: border .15s, transform .15s; display: flex; flex-direction: column; }
+.card:hover { border-color: var(--accent); transform: translateY(-2px); }
+.card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.card .name { font-weight: 700; color: var(--accent2); font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card .ops { display: flex; gap: 4px; flex-shrink: 0; }
+.icon-btn { border: 0; background: transparent; cursor: pointer; color: var(--text3); font-size: 15px;
+  padding: 4px 7px; border-radius: 6px; transition: all .15s; font-family: inherit; }
+.icon-btn:hover { background: var(--bg3); color: var(--text); }
+.icon-btn.del:hover { color: var(--danger); }
+.card .prompt { margin: 10px 0 0; color: var(--text2); font-size: 12.5px; line-height: 1.6;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace; white-space: pre-wrap; word-break: break-word;
+  max-height: 66px; overflow: hidden; position: relative; }
+.card .prompt.collapsed::after { content: ""; position: absolute; bottom: 0; left: 0; right: 0; height: 28px;
+  background: linear-gradient(transparent, var(--bg2)); }
+.card .prompt.expanded { max-height: none; }
+.expand-toggle { border: 0; background: transparent; color: var(--accent2); font-size: 12px; cursor: pointer;
+  padding: 5px 0 0; align-self: flex-start; font-family: inherit; }
+.empty { color: var(--text3); text-align: center; padding: 50px 0; font-size: 14px; }
+.empty .big { font-size: 40px; display: block; margin-bottom: 10px; }
+.modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,.65); backdrop-filter: blur(3px);
+  display: none; align-items: center; justify-content: center; z-index: 50; padding: 20px; }
+.modal-mask.show { display: flex; }
+.modal { background: var(--bg2); border: 1px solid var(--border); border-radius: 14px; padding: 24px;
+  width: 100%; max-width: 560px; box-shadow: 0 20px 60px rgba(0,0,0,.5); animation: pop .18s ease; }
+@keyframes pop { from { transform: scale(.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+.modal h2 { margin: 0 0 18px; font-size: 18px; }
+.modal label { display: block; margin: 12px 0 6px; color: var(--text2); font-size: 13px; font-weight: 600; }
+.modal input, .modal textarea { width: 100%; border: 1px solid var(--border); border-radius: 9px; padding: 10px 12px;
+  background: var(--bg); color: var(--text); font-size: 14px; font-family: inherit; outline: none; transition: border .15s; }
+.modal input:focus, .modal textarea:focus { border-color: var(--border-focus); box-shadow: 0 0 0 3px var(--accent-glow); }
+.modal textarea { min-height: 130px; resize: vertical; font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 13px; line-height: 1.55; }
+.char-count { text-align: right; font-size: 11.5px; color: var(--text3); margin-top: 4px; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
+#toasts { position: fixed; top: 20px; right: 20px; z-index: 100; display: flex; flex-direction: column; gap: 10px; }
+.toast { background: var(--bg2); border: 1px solid var(--border); border-left: 4px solid var(--success);
+  border-radius: 10px; padding: 12px 18px; min-width: 220px; box-shadow: 0 8px 30px rgba(0,0,0,.4);
+  animation: slidein .25s ease; font-size: 14px; }
+.toast.error { border-left-color: var(--danger); }
+@keyframes slidein { from { transform: translateX(120%); opacity: 0; } to { transform: none; opacity: 1; } }
+.toast.out { transition: all .3s; transform: translateX(120%); opacity: 0; }
+@media (max-width: 640px) {
+  .grid { grid-template-columns: 1fr; }
+  header { flex-direction: column; align-items: stretch; }
+  .toolbar { justify-content: flex-end; }
+}
 </style>
 </head>
 <body>
 <main>
-<h1>NovelAI 预设管理</h1>
-<p class="hint">保存后可在画图指令中引用，直接写名称即可（也支持 <code>@人物名</code>、<code>#风格名</code>），例如：<code>/画图 风堇 风格052 花田</code></p>
-<div class="tabs"><button id="characters-tab" class="active" onclick="switchKind('characters')">人物预设</button><button id="styles-tab" onclick="switchKind('styles')">风格预设</button></div>
-<section class="panel">
-<form id="preset-form" onsubmit="savePreset(event)">
-<label for="preset-name">名称</label>
-<input id="preset-name" maxlength="40" required placeholder="例如：风堇">
-<label for="preset-prompt">提示词</label>
-<textarea id="preset-prompt" maxlength="4000" required placeholder="例如：hyacine, honkai star rail, 1girl"></textarea>
-<div class="actions"><button class="primary" type="submit">保存预设</button><button type="button" onclick="clearForm()">清空</button></div>
-</form>
-<div id="status"></div>
-<div id="items" class="items"></div>
-</section>
+<header>
+  <div class="title">
+    <h1><span class="logo">🎨</span>NovelAI 预设管理</h1>
+    <p class="hint">画图指令中直接写名称即可引用，也支持 <code>@人物名</code>、<code>#风格名</code>，例如 <code>/画图 椿 风格052 花田</code></p>
+  </div>
+  <div class="toolbar">
+    <button class="btn sm" onclick="exportPresets()">⬇ 导出</button>
+    <button class="btn sm" onclick="el('import-file').click()">⬆ 导入</button>
+    <button class="btn primary sm" onclick="openModal()">＋ 新增预设</button>
+    <input type="file" id="import-file" accept=".json" style="display:none" onchange="importPresets(event)">
+  </div>
+</header>
+<div class="tabs">
+  <button class="tab active" id="tab-characters" onclick="switchKind('characters')">人物预设<span class="count" id="count-characters">0</span></button>
+  <button class="tab" id="tab-styles" onclick="switchKind('styles')">风格预设<span class="count" id="count-styles">0</span></button>
+</div>
+<div class="search-bar">
+  <div class="search-wrap"><span class="icon">🔍</span><input id="search" placeholder="搜索名称或提示词..." oninput="render()"></div>
+</div>
+<div id="items" class="grid"></div>
 </main>
+<div class="modal-mask" id="modal-mask" onclick="if(event.target===this)closeModal()">
+  <div class="modal">
+    <h2 id="modal-title">新增预设</h2>
+    <form id="preset-form" onsubmit="savePreset(event)">
+      <label for="preset-name">名称</label>
+      <input id="preset-name" maxlength="40" required placeholder="例如：风堇">
+      <label for="preset-prompt">提示词</label>
+      <textarea id="preset-prompt" maxlength="4000" required placeholder="例如：hyacine, honkai star rail, 1girl" oninput="updateCount()"></textarea>
+      <div class="char-count"><span id="char-count">0</span> / 4000</div>
+      <div class="modal-actions">
+        <button type="button" class="btn" onclick="closeModal()">取消</button>
+        <button type="submit" class="btn primary">保存</button>
+      </div>
+    </form>
+  </div>
+</div>
+<div id="toasts"></div>
 <script>
 let currentKind = 'characters';
 let presets = { characters: {}, styles: {} };
+let editingName = null;
 const labels = { characters: '人物', styles: '风格' };
 const el = (id) => document.getElementById(id);
-function setStatus(message, error = false) { const node = el('status'); node.textContent = message; node.style.color = error ? '#fca5a5' : '#a7f3d0'; }
-function switchKind(kind) { currentKind = kind; document.querySelectorAll('.tabs button').forEach((node) => node.classList.remove('active')); el(kind + '-tab').classList.add('active'); clearForm(); render(); }
-function clearForm() { el('preset-name').value = ''; el('preset-prompt').value = ''; }
-function escapeHtml(value) { return String(value).replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[char])); }
+
+function toast(message, error = false) {
+  const box = document.createElement('div');
+  box.className = 'toast' + (error ? ' error' : '');
+  box.textContent = message;
+  el('toasts').appendChild(box);
+  setTimeout(() => { box.classList.add('out'); setTimeout(() => box.remove(), 350); }, 2600);
+}
+function escapeHtml(value) {
+  return String(value).replace(/[&<>'"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[c]));
+}
+function switchKind(kind) {
+  currentKind = kind;
+  document.querySelectorAll('.tab').forEach((n) => n.classList.remove('active'));
+  el('tab-' + kind).classList.add('active');
+  render();
+}
+function updateCounts() {
+  el('count-characters').textContent = Object.keys(presets.characters || {}).length;
+  el('count-styles').textContent = Object.keys(presets.styles || {}).length;
+}
+function updateCount() { el('char-count').textContent = el('preset-prompt').value.length; }
+function toggleExpand(btn) {
+  const p = btn.previousElementSibling;
+  const expanded = p.classList.toggle('expanded');
+  p.classList.toggle('collapsed', !expanded);
+  btn.textContent = expanded ? '收起 ▲' : '展开 ▼';
+}
 function render() {
   const node = el('items');
-  const entries = Object.entries(presets[currentKind] || {});
-  if (!entries.length) { node.innerHTML = '<div class="empty">还没有' + labels[currentKind] + '预设。</div>'; return; }
-  node.innerHTML = entries.map(([name, prompt]) => '<article class="item"><div class="item-head"><span class="name">' + escapeHtml(name) + '</span><span class="item-actions"><button type="button" onclick="editPreset(' + JSON.stringify(name) + ')">编辑</button><button class="danger" type="button" onclick="removePreset(' + JSON.stringify(name) + ')">删除</button></span></div><div class="prompt">' + escapeHtml(prompt) + '</div></article>').join('');
+  const query = el('search').value.trim().toLowerCase();
+  let entries = Object.entries(presets[currentKind] || {});
+  if (query) entries = entries.filter(([n, p]) => n.toLowerCase().includes(query) || p.toLowerCase().includes(query));
+  entries.sort((a, b) => a[0].localeCompare(b[0], 'zh'));
+  if (!entries.length) {
+    node.innerHTML = '<div class="empty" style="grid-column:1/-1"><span class="big">🗒️</span>' +
+      (query ? '没有匹配的预设' : '还没有' + labels[currentKind] + '预设，点击右上角「新增预设」创建') + '</div>';
+    return;
+  }
+  node.innerHTML = entries.map(([name, prompt]) => {
+    const long = prompt.length > 120 || prompt.split('\n').length > 3;
+    return '<article class="card"><div class="card-head"><span class="name" title="' + escapeHtml(name) + '">' + escapeHtml(name) + '</span>' +
+      '<span class="ops"><button class="icon-btn" title="复制提示词" onclick="copyPrompt(' + JSON.stringify(name) + ')">📋</button>' +
+      '<button class="icon-btn" title="编辑" onclick="openModal(' + JSON.stringify(name) + ')">✏️</button>' +
+      '<button class="icon-btn del" title="删除" onclick="removePreset(' + JSON.stringify(name) + ')">🗑️</button></span></div>' +
+      '<div class="prompt' + (long ? ' collapsed' : '') + '">' + escapeHtml(prompt) + '</div>' +
+      (long ? '<button class="expand-toggle" onclick="toggleExpand(this)">展开 ▼</button>' : '') + '</article>';
+  }).join('');
 }
 async function loadPresets() {
-  try { const response = await fetch('api/presets'); if (!response.ok) throw new Error('加载失败'); presets = await response.json(); render(); }
-  catch (error) { setStatus(error.message, true); }
+  try {
+    const r = await fetch('api/presets');
+    if (!r.ok) throw new Error('加载失败');
+    presets = await r.json();
+    updateCounts(); render();
+  } catch (e) { toast(e.message, true); }
 }
-function editPreset(name) { el('preset-name').value = name; el('preset-prompt').value = presets[currentKind][name] || ''; el('preset-name').focus(); }
+function openModal(name) {
+  editingName = name || null;
+  el('modal-title').textContent = (name ? '编辑' : '新增') + labels[currentKind] + '预设';
+  el('preset-name').value = name || '';
+  el('preset-prompt').value = name ? (presets[currentKind][name] || '') : '';
+  updateCount();
+  el('modal-mask').classList.add('show');
+  setTimeout(() => el('preset-name').focus(), 50);
+}
+function closeModal() { el('modal-mask').classList.remove('show'); }
 async function savePreset(event) {
   event.preventDefault();
   try {
-    const response = await fetch('api/presets/' + currentKind, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: el('preset-name').value, prompt: el('preset-prompt').value }) });
-    const result = await response.json(); if (!response.ok) throw new Error(result.detail || '保存失败');
-    presets = result; render(); setStatus('保存成功'); clearForm();
-  } catch (error) { setStatus(error.message, true); }
+    const r = await fetch('api/presets/' + currentKind, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: el('preset-name').value, prompt: el('preset-prompt').value })
+    });
+    const result = await r.json();
+    if (!r.ok) throw new Error(result.detail || '保存失败');
+    presets = result; updateCounts(); render(); closeModal();
+    toast(editingName ? '预设已更新' : '预设已保存');
+  } catch (e) { toast(e.message, true); }
 }
 async function removePreset(name) {
   if (!confirm('确定删除「' + name + '」吗？')) return;
-  try { const response = await fetch('api/presets/' + currentKind + '/' + encodeURIComponent(name), { method: 'DELETE' }); const result = await response.json(); if (!response.ok) throw new Error(result.detail || '删除失败'); presets = result; render(); setStatus('删除成功'); }
-  catch (error) { setStatus(error.message, true); }
+  try {
+    const r = await fetch('api/presets/' + currentKind + '/' + encodeURIComponent(name), { method: 'DELETE' });
+    const result = await r.json();
+    if (!r.ok) throw new Error(result.detail || '删除失败');
+    presets = result; updateCounts(); render(); toast('已删除「' + name + '」');
+  } catch (e) { toast(e.message, true); }
 }
+async function copyPrompt(name) {
+  try {
+    await navigator.clipboard.writeText(presets[currentKind][name] || '');
+    toast('已复制「' + name + '」的提示词');
+  } catch (e) { toast('复制失败', true); }
+}
+function exportPresets() {
+  const blob = new Blob([JSON.stringify(presets, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'novelai_presets_' + new Date().toISOString().slice(0, 10) + '.json';
+  a.click(); URL.revokeObjectURL(a.href);
+  toast('导出成功');
+}
+async function importPresets(event) {
+  const file = event.target.files[0];
+  event.target.value = '';
+  if (!file) return;
+  try {
+    const data = JSON.parse(await file.text());
+    const tasks = [];
+    for (const kind of ['characters', 'styles']) {
+      for (const [name, prompt] of Object.entries(data[kind] || {})) {
+        tasks.push(fetch('api/presets/' + kind, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, prompt })
+        }));
+      }
+    }
+    if (!tasks.length) { toast('文件中没有可导入的预设', true); return; }
+    await Promise.all(tasks);
+    await loadPresets();
+    toast('导入完成：' + tasks.length + ' 个预设');
+  } catch (e) { toast('导入失败: ' + e.message, true); }
+}
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeModal();
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && el('modal-mask').classList.contains('show')) el('preset-form').requestSubmit();
+});
 loadPresets();
 </script>
 </body>
-</html>"""
+</html>
+"""
 
 
 @plugin.mount_router()
