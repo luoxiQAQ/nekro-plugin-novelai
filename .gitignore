@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+*.bak*
+generated/
+raw_*.png
