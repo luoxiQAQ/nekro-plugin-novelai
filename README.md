@@ -26,7 +26,7 @@
 - 检查前后是否为分隔符（逗号、空格、句首/句尾），防止子串误触发
 - 例如：预设「椿」不会匹配「椿花绽放」，但会匹配「椿，花田」
 
-仓库附带 `presets.json`，包含 **1062 个角色预设**（明日方舟 431 / 原神 114 / 蔚蓝档案 104 / 崩坏星穹铁道 85 / 鸣潮 58 / 崩坏3 37 / 绝区零 11 等 20 余个作品）与 **61 个画风预设**。
+仓库附带 `presets.json`，包含 **1062 个角色预设**（明日方舟 431 / 原神 114 / 蔚蓝档案 104 / 崩坏星穹铁道 85 / 鸣潮 58 / 崩坏3 37 / 绝区零 11 等 20 余个作品）。画风预设需要自行添加。
 
 ### 🌐 智能分段翻译
 
@@ -130,7 +130,7 @@ git clone https://github.com/luoxiQAQ/nekro-plugin-novelai.git nekro_plugin_nove
 
 ### 导入预设
 
-仓库附带的 `presets.json` 包含 1062 个角色预设与 61 个画风预设。将其复制到插件数据目录：
+仓库附带的 `presets.json` 包含 1062 个角色预设（不含画风预设，请自行添加）。将其复制到插件数据目录：
 
 ```bash
 cp presets.json /path/to/nekro_agent/plugin_data/luoxi.novelai/presets.json
@@ -140,8 +140,12 @@ cp presets.json /path/to/nekro_agent/plugin_data/luoxi.novelai/presets.json
 
 ```json
 {
-  "characters": { "风堇": "masterpiece, best quality, very aesthetic, 1girl, solo, hyacine (honkai: star rail)" },
-  "styles": { "风格001": "artist:akakura" }
+  "characters": {
+    "风堇": "masterpiece, best quality, very aesthetic, 1girl, solo, hyacine (honkai: star rail)"
+  },
+  "styles": {
+    "风格001": "artist:akakura"
+  }
 }
 ```
 
