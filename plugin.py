@@ -1526,17 +1526,21 @@ async def novelai_generate(
     model: str = "",
     send_to_chat: bool = True,
 ) -> str:
-    """Generate an image with NovelAI.
+    """使用 NovelAI 生成动漫/插画图片（文生图）。
+
+    当用户在对话中用自然语言要求画图/生成图片时调用本工具，例如：
+    「画一张穿白裙的少女站在花田里」「帮我画个猫娘」「来张赛博朋克城市夜景」「生成一张图片」。
+    用户只是在描述/讨论画面、没有要求出图时不要调用。
 
     Args:
-        prompt: Image description. Can be Chinese (auto-translated) or English danbooru tags.
-        size: Optional size as WIDTHxHEIGHT. Empty uses plugin default.
-        negative_prompt: Additional negative prompt tags to avoid.
-        model: Model name override. Empty uses plugin default.
-        send_to_chat: Send the generated image to chat.
+        prompt: 画面描述。中文自然语言或英文 danbooru 标签均可，中文会自动翻译；可直接使用预设名（人物预设如「椿」，风格预设如「风格052」，会自动展开）。
+        size: 图片尺寸。可用「竖」(832x1216) /「横」(1216x832) /「方」(1024x1024)，或写成 WIDTHxHEIGHT（如 832x1216）。留空使用插件默认。
+        negative_prompt: 额外负面提示词（不想出现的元素）。
+        model: 模型名覆盖，留空使用插件默认。
+        send_to_chat: 是否把生成结果直接发送到当前会话，默认 True。
 
     Returns:
-        The generated image sandbox path.
+        生成图片的沙盒路径。
     """
     blocked = _blacklist_reason(_ctx)
     if blocked:
@@ -1565,20 +1569,22 @@ async def novelai_img2img(
     model: str = "",
     send_to_chat: bool = True,
 ) -> str:
-    """Generate an image based on a reference image with NovelAI (img2img).
+    """使用 NovelAI 以一张参考图片生成新图片（图生图）。
+
+    当用户发来图片要求修改/重绘/换风格/换场景时调用，例如：「把这张图改成…」「按这张图重新画」「以此图为参考画一张…」。
 
     Args:
-        image_path: Sandbox path to the reference image.
-        prompt: Prompt describing the desired output. Can be Chinese or English tags.
-        size: Optional size as WIDTHxHEIGHT. Empty uses plugin default.
-        strength: img2img strength (0.1-0.9). 0 uses plugin default.
-        noise: img2img noise (0.0-1.0). -1 uses plugin default.
-        negative_prompt: Additional negative prompt tags.
-        model: Model name override. Empty uses plugin default.
-        send_to_chat: Send the result to chat.
+        image_path: 参考图片的沙盒路径（一般是用户发来的图片或沙盒中的图片文件）。
+        prompt: 期望的画面描述。中文会自动翻译；支持预设名（人物/风格预设自动展开）。
+        size: 输出尺寸，用法同文生图（竖/横/方 或 WIDTHxHEIGHT）。留空使用插件默认。
+        strength: 图生图强度 0.1-0.9，越大越偏离原图；0 使用插件默认。
+        noise: 图生图噪声 0.0-1.0；-1 使用插件默认。
+        negative_prompt: 额外负面提示词。
+        model: 模型名覆盖，留空使用插件默认。
+        send_to_chat: 是否把生成结果直接发送到当前会话，默认 True。
 
     Returns:
-        The generated image sandbox path.
+        生成图片的沙盒路径。
     """
     blocked = _blacklist_reason(_ctx)
     if blocked:
