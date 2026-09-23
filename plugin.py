@@ -41,7 +41,7 @@ _plugin_kwargs: dict = dict(
     name="NovelAI 画图",
     module_name="novelai",
     description="NovelAI 文生图/图生图插件，支持 NAI v3/v4/v4.5/v5 模型。",
-    version="1.2.0",
+    version="1.3.0",
     author="luoxi",
     url="",
     i18n_name=i18n.i18n_text(zh_CN="NovelAI 画图", en_US="NovelAI Image"),
@@ -153,6 +153,12 @@ class NovelAIConfig(ConfigBase):
         description="用于将中文提示词翻译为英文 danbooru 标签的聊天模型组。留空则不翻译。",
         json_schema_extra=ExtraField(ref_model_groups=True, required=False, model_type="chat").model_dump(),
     )
+    DRAW_BLACKLIST: str = Field(
+        default="",
+        title="画图黑名单",
+        description="每行一个 QQ 号或群号，命中的人/群无法使用画图、重画和 AI 画图工具。行内 # 之后为注释，号码后可跟备注。可用 QQ 指令「拉黑/解除拉黑/黑名单」管理。",
+        json_schema_extra=ExtraField(is_textarea=True).model_dump(),
+    )
 
 
 config: NovelAIConfig = plugin.get_config(NovelAIConfig)
@@ -166,7 +172,22 @@ class PresetStore:
     def __init__(self) -> None:
         self.path = plugin.get_plugin_data_dir() / "presets.json"
         self._lock = threading.RLock()
+        self._sig = self._signature()
         self._data = self._load()
+
+    def _signature(self) -> Optional[tuple[int, int]]:
+        try:
+            st = self.path.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    def _reload_if_changed(self) -> None:
+        signature = self._signature()
+        if signature == self._sig:
+            return
+        self._data = self._load()
+        self._sig = signature
 
     def _load(self) -> dict:
         try:
@@ -195,6 +216,7 @@ class PresetStore:
             json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         temporary_path.replace(self.path)
+        self._sig = self._signature()
 
     @staticmethod
     def _check_kind(kind: str) -> str:
@@ -218,17 +240,20 @@ class PresetStore:
 
     def all(self) -> dict:
         with self._lock:
+            self._reload_if_changed()
             return {kind: dict(values) for kind, values in self._data.items()}
 
     def get(self, kind: str, name: str) -> Optional[str]:
         kind = self._check_kind(kind)
         with self._lock:
+            self._reload_if_changed()
             return self._data[kind].get(name.strip())
 
     def set(self, kind: str, name: str, prompt: str) -> None:
         kind = self._check_kind(kind)
         name, prompt = self._check_values(name, prompt)
         with self._lock:
+            self._reload_if_changed()
             self._data[kind][name] = prompt
             self._save()
 
@@ -236,6 +261,7 @@ class PresetStore:
         kind = self._check_kind(kind)
         count = 0
         with self._lock:
+            self._reload_if_changed()
             for name, prompt in items.items():
                 try:
                     clean_name, clean_prompt = self._check_values(str(name), str(prompt))
@@ -250,6 +276,7 @@ class PresetStore:
     def delete(self, kind: str, name: str) -> bool:
         kind = self._check_kind(kind)
         with self._lock:
+            self._reload_if_changed()
             if name.strip() not in self._data[kind]:
                 return False
             del self._data[kind][name.strip()]
@@ -626,6 +653,70 @@ def _chat_key_of(context) -> str:
     return getattr(context, "chat_key", None) or getattr(context, "channel_id", None) or "default"
 
 
+def _blacklist_entries() -> dict:
+    """解析画图黑名单配置，返回 {QQ号或群号: 备注}。"""
+    entries: dict = {}
+    raw = (config.DRAW_BLACKLIST or "").replace("，", "\n").replace(",", "\n")
+    for line in raw.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        number, _, note = line.partition(" ")
+        number = number.strip()
+        if number.isdigit():
+            entries[number] = note.strip()
+    return entries
+
+
+def _blacklist_number_of(context) -> str:
+    """取上下文对应的"当前群号/当前用户号"，取不到返回空串。"""
+    try:
+        chat_key = str(getattr(context, "chat_key", "") or "")
+    except Exception:
+        chat_key = ""
+    match = re.search(r"group_(\d+)", chat_key)
+    if match:
+        return match.group(1)
+    if str(getattr(context, "channel_type", "") or "") == "group":
+        channel_id = str(getattr(context, "channel_id", "") or "")
+        if channel_id.isdigit():
+            return channel_id
+    return str(getattr(context, "user_id", "") or "").strip()
+
+
+def _blacklist_reason(context) -> str:
+    """命中画图黑名单则返回命中对象（如「群 123456」），未命中返回空串。
+
+    同时兼容命令上下文（CommandExecutionContext）与沙盒工具上下文（AgentCtx）。
+    """
+    entries = _blacklist_entries()
+    if not entries:
+        return ""
+    try:
+        chat_key = str(getattr(context, "chat_key", "") or "")
+    except Exception:
+        chat_key = ""
+    match = re.search(r"group_(\d+)", chat_key)
+    group_id = match.group(1) if match else ""
+    if not group_id and str(getattr(context, "channel_type", "") or "") == "group":
+        group_id = str(getattr(context, "channel_id", "") or "")
+    if group_id and group_id in entries:
+        return f"群 {group_id}"
+    try:
+        user_id = str(getattr(context, "from_platform_userid", "") or "")
+    except Exception:
+        user_id = ""
+    user_id = user_id or str(getattr(context, "user_id", "") or "")
+    if user_id and user_id in entries:
+        return f"用户 {user_id}"
+    return ""
+
+
+def _blacklist_save(entries: dict) -> None:
+    config.DRAW_BLACKLIST = "\n".join(f"{number} {note}".strip() for number, note in entries.items())
+    plugin.save_config(config)
+
+
 def _cleanup_generated(save_dir: Path, max_age: float = 86400) -> None:
     try:
         cutoff = _time.time() - max_age
@@ -706,6 +797,10 @@ async def cmd_draw(
     prompt: Annotated[str, Arg("画图提示词", positional=True, greedy=True)] = "",
 ) -> AsyncIterator[CommandResponse]:
     """使用 NovelAI 生成图片。支持中文描述（自动翻译）、英文 danbooru 标签、预设引用（@人物/#风格/裸名）。末尾加「竖/方/横」指定尺寸。"""
+    blocked = _blacklist_reason(context)
+    if blocked:
+        yield CmdCtl.failed(f"画图功能已对{blocked}禁用。")
+        return
     if not prompt.strip():
         yield CmdCtl.failed("请提供画图提示词，例如: /nai 一个穿白裙子的少女站在花田里\n加「竖」「方」「横」可指定尺寸")
         return
@@ -740,6 +835,10 @@ async def cmd_redraw(
     context: CommandExecutionContext,
     extra: Annotated[str, Arg("追加描述", positional=True, greedy=True)] = "",
 ) -> AsyncIterator[CommandResponse]:
+    blocked = _blacklist_reason(context)
+    if blocked:
+        yield CmdCtl.failed(f"画图功能已对{blocked}禁用。")
+        return
     chat_key = _chat_key_of(context)
     last = _last_draw.get(chat_key)
     if not last:
@@ -880,6 +979,84 @@ async def cmd_delete_style(
 async def cmd_list_styles(context: CommandExecutionContext) -> AsyncIterator[CommandResponse]:
     yield CmdCtl.message(_preset_list_text("styles"))
 
+
+@plugin.mount_command(
+    name="拉黑",
+    description="禁止某个 QQ 号或群使用本插件画图（管理员）",
+    aliases=["加入黑名单"],
+    permission=CommandPermission.SUPER_USER,
+    usage="拉黑 [QQ号或群号] [备注]（不带号码则拉黑当前群/当前用户）",
+)
+async def cmd_blacklist_add(
+    context: CommandExecutionContext,
+    target: Annotated[str, Arg("QQ号或群号", positional=True)] = "",
+    note: Annotated[str, Arg("备注", positional=True, greedy=True)] = "",
+) -> AsyncIterator[CommandResponse]:
+    target = target.strip()
+    if not target:
+        target = _blacklist_number_of(context)
+    if not target.isdigit():
+        yield CmdCtl.failed("请提供 QQ 号或群号，例如：/拉黑 123456789 水群；不带号码则拉黑当前群（私聊则为当前用户）。")
+        return
+    entries = _blacklist_entries()
+    existed = target in entries
+    entries[target] = note.strip() or entries.get(target, "")
+    try:
+        _blacklist_save(entries)
+    except Exception as exc:
+        yield CmdCtl.failed(f"黑名单保存失败: {exc}")
+        return
+    label = "已在黑名单中，备注已更新" if existed else "已加入画图黑名单"
+    suffix = f"（{entries[target]}）" if entries[target] else ""
+    yield CmdCtl.success(f"✅ {target}{suffix} {label}，当前共 {len(entries)} 条。用 /解除拉黑 {target} 可恢复。")
+
+
+@plugin.mount_command(
+    name="解除拉黑",
+    description="把某个 QQ 号或群移出画图黑名单（管理员）",
+    aliases=["移出黑名单"],
+    permission=CommandPermission.SUPER_USER,
+    usage="解除拉黑 [QQ号或群号]",
+)
+async def cmd_blacklist_remove(
+    context: CommandExecutionContext,
+    target: Annotated[str, Arg("QQ号或群号", positional=True)] = "",
+) -> AsyncIterator[CommandResponse]:
+    target = target.strip()
+    if not target:
+        target = _blacklist_number_of(context)
+    if not target.isdigit():
+        yield CmdCtl.failed("请提供要移出黑名单的 QQ 号或群号，例如：/解除拉黑 123456789")
+        return
+    entries = _blacklist_entries()
+    if target not in entries:
+        yield CmdCtl.failed(f"{target} 不在画图黑名单中。用 /黑名单 查看当前名单。")
+        return
+    entries.pop(target)
+    try:
+        _blacklist_save(entries)
+    except Exception as exc:
+        yield CmdCtl.failed(f"黑名单保存失败: {exc}")
+        return
+    yield CmdCtl.success(f"✅ {target} 已移出画图黑名单，剩 {len(entries)} 条。")
+
+
+@plugin.mount_command(
+    name="黑名单",
+    description="查看画图黑名单（管理员）",
+    aliases=["黑名单列表"],
+    permission=CommandPermission.SUPER_USER,
+    usage="黑名单",
+)
+async def cmd_blacklist_list(context: CommandExecutionContext) -> AsyncIterator[CommandResponse]:
+    entries = _blacklist_entries()
+    if not entries:
+        yield CmdCtl.message("画图黑名单为空。用 /拉黑 <QQ号或群号> [备注] 添加。")
+        return
+    lines = [f"画图黑名单（{len(entries)} 条）："]
+    lines.extend(f"- {number}" + (f"（{note}）" if note else "") for number, note in entries.items())
+    lines.append("用 /解除拉黑 <QQ号或群号> 移除。")
+    yield CmdCtl.message("\n".join(lines))
 
 
 @plugin.mount_command(
@@ -1361,6 +1538,9 @@ async def novelai_generate(
     Returns:
         The generated image sandbox path.
     """
+    blocked = _blacklist_reason(_ctx)
+    if blocked:
+        return f"画图功能已对{blocked}禁用（黑名单），无法生成图片。不要再尝试调用画图工具，直接告知用户被管理员禁用了。"
     width, height = _parse_size(size)
     image_data = await _call_txt2img(prompt=prompt, width=width, height=height, model=model, negative_prompt=negative_prompt)
     path = await _forward_result(_ctx, image_data)
@@ -1400,6 +1580,9 @@ async def novelai_img2img(
     Returns:
         The generated image sandbox path.
     """
+    blocked = _blacklist_reason(_ctx)
+    if blocked:
+        return f"画图功能已对{blocked}禁用（黑名单），无法生成图片。不要再尝试调用画图工具，直接告知用户被管理员禁用了。"
     ref_path = Path(image_path)
     if not ref_path.exists():
         sandbox_path = Path(_ctx.fs.sandbox_path) / image_path.lstrip("/")
