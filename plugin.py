@@ -5,8 +5,10 @@ import io
 import json
 import random
 import re
+import secrets as _secrets
 import threading
 import zipfile
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Annotated, Any, AsyncIterator, Dict, List, Literal, Optional
 
@@ -33,6 +35,8 @@ from nekro_agent.services.command.schemas import (
 )
 from nekro_agent.api.schemas import AgentCtx
 from nekro_agent.core import logger
+
+from . import gallery_upload
 
 
 import inspect as _inspect
@@ -152,6 +156,17 @@ class NovelAIConfig(ConfigBase):
         title="翻译大模型",
         description="用于将中文提示词翻译为英文 danbooru 标签的聊天模型组。留空则不翻译。",
         json_schema_extra=ExtraField(ref_model_groups=True, required=False, model_type="chat").model_dump(),
+    )
+    GALLERY_UPLOAD_URL: str = Field(
+        default="",
+        title="图库上传地址",
+        description="画完图自动上传到图库网站的接口地址。留空或未填密钥则不启用。",
+    )
+    GALLERY_UPLOAD_KEY: str = Field(
+        default="",
+        title="图库上传密钥",
+        description="图库网站的上传密钥。",
+        json_schema_extra=ExtraField(is_secret=True).model_dump(),
     )
     DRAW_BLACKLIST: str = Field(
         default="",
@@ -285,6 +300,40 @@ class PresetStore:
 
 
 preset_store = PresetStore()
+
+# 画廊画图密钥库：与图库网站共用同一份文件，图库每 NAI5 次生成会回写 used
+GALLERY_KEYS_PATH = plugin.get_plugin_data_dir() / "gallery_draw_keys.json"
+_keys_lock = threading.RLock()
+
+
+def _load_draw_keys() -> list:
+    """读盘取最新密钥列表（图库那边也会改这份文件，不能缓存）。"""
+    try:
+        data = json.loads(GALLERY_KEYS_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return []
+    keys = data.get("keys") if isinstance(data, dict) else None
+    if not isinstance(keys, list):
+        return []
+    return [k for k in keys if isinstance(k, dict) and str(k.get("key") or "").strip()]
+
+
+def _save_draw_keys(keys: list) -> None:
+    GALLERY_KEYS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = GALLERY_KEYS_PATH.with_suffix(".nekrotmp")
+    temporary_path.write_text(
+        json.dumps({"keys": keys}, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary_path.chmod(0o600)
+    temporary_path.replace(GALLERY_KEYS_PATH)
+
+
+def _key_left(entry: dict) -> int:
+    try:
+        return max(0, int(entry.get("limit", 0)) - int(entry.get("used", 0)))
+    except (TypeError, ValueError):
+        return 0
+
 
 _last_draw: dict[str, dict] = {}
 
@@ -560,8 +609,22 @@ async def _call_txt2img(prompt, width=0, height=0, steps=0, scale=0, sampler="",
     steps = steps or config.DEFAULT_STEPS
     scale = scale or config.DEFAULT_SCALE
     sampler = sampler or config.DEFAULT_SAMPLER
+    raw_prompt = prompt
     prompt = await _translate_prompt(_expand_preset_prompt(prompt))
     params = _build_parameters(prompt, width, height, steps, scale, sampler, model, negative_prompt)
+    info = {
+        "raw_prompt": raw_prompt,
+        "prompt": prompt,
+        "negative_prompt": _get_negative_prompt(negative_prompt),
+        "width": width,
+        "height": height,
+        "steps": steps,
+        "scale": scale,
+        "sampler": sampler,
+        "model": model,
+        "seed": params.get("seed"),
+        "image_type": "txt2img",
+    }
     payload = {"input": prompt, "model": model, "action": "generate", "parameters": params}
     api_url = _get_api_url("generate-image")
     max_retries = 3 if len(_get_tokens()) > 1 else 2
@@ -577,7 +640,7 @@ async def _call_txt2img(prompt, width=0, height=0, steps=0, scale=0, sampler="",
                     if img is None:
                         raise Exception("无法从响应中提取图片")
                     logger.info(f"NovelAI 文生图成功: model={model} ({_model_label(model)}), {width}x{height}")
-                    return img
+                    return img, info
                 elif response.status_code in (401, 402, 429):
                     reason = f"HTTP {response.status_code}: {response.text[:60]}"
                     if retry < max_retries - 1 and _rotate_token(reason):
@@ -606,11 +669,27 @@ async def _call_img2img(prompt, image_b64, width=0, height=0, steps=0, scale=0, 
     scale = scale or config.DEFAULT_SCALE
     strength = strength or config.IMG2IMG_STRENGTH
     noise = noise if noise >= 0 else config.IMG2IMG_NOISE
+    raw_prompt = prompt
     prompt = await _translate_prompt(_expand_preset_prompt(prompt))
     params = _build_parameters(prompt, width, height, steps, scale, config.DEFAULT_SAMPLER, model, negative_prompt)
     params["image"] = image_b64
     params["strength"] = strength
     params["noise"] = noise
+    info = {
+        "raw_prompt": raw_prompt,
+        "prompt": prompt,
+        "negative_prompt": _get_negative_prompt(negative_prompt),
+        "width": width,
+        "height": height,
+        "steps": steps,
+        "scale": scale,
+        "sampler": config.DEFAULT_SAMPLER,
+        "model": model,
+        "seed": params.get("seed"),
+        "image_type": "img2img",
+        "strength": strength,
+        "noise": noise,
+    }
     payload = {"input": prompt, "model": model, "action": "img2img", "parameters": params}
     api_url = _get_api_url("generate-image")
     async with httpx.AsyncClient(**_build_client_config()) as client:
@@ -621,7 +700,7 @@ async def _call_img2img(prompt, image_b64, width=0, height=0, steps=0, scale=0, 
             if img is None:
                 raise Exception("无法从响应中提取图片")
             logger.info(f"NovelAI 图生图成功: model={model}, strength={strength}, noise={noise}")
-            return img
+            return img, info
         elif response.status_code in (401, 402, 429):
             reason = f"HTTP {response.status_code}: {response.text[:60]}"
             if _rotate_token(reason):
@@ -631,7 +710,7 @@ async def _call_img2img(prompt, image_b64, width=0, height=0, steps=0, scale=0, 
                     img = _extract_image(response.content)
                     if img is None:
                         raise Exception("无法从响应中提取图片")
-                    return img
+                    return img, info
             raise Exception(f"NovelAI API 认证/配额错误: {reason}")
         else:
             raise Exception(f"NovelAI API 错误: {response.status_code} {response.text[:200]}")
@@ -743,6 +822,35 @@ def _save_generated(image_data: bytes, chat_key: str, prompt: str, width: int, h
     return str(file_path.resolve())
 
 
+_gallery_tasks: set = set()
+
+
+async def _run_gallery_upload(image_data: bytes, meta: dict, url: str, key: str) -> None:
+    ok, detail = await gallery_upload.upload_to_gallery(
+        image_data, meta, url, key, name=gallery_upload.build_name()
+    )
+    if ok:
+        logger.info(f"图库上传成功: {detail}")
+    else:
+        logger.warning(f"图库上传失败: {detail}")
+
+
+def _schedule_gallery_upload(image_data: bytes, info: dict) -> None:
+    """画完图后异步上传到图库网站，不阻塞回复；未配置地址或密钥则不启用。"""
+    url = (config.GALLERY_UPLOAD_URL or "").strip()
+    key = (config.GALLERY_UPLOAD_KEY or "").strip()
+    if not url or not key:
+        return
+    meta = dict(info)
+    meta["saved_at"] = _time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        task = asyncio.create_task(_run_gallery_upload(image_data, meta, url, key))
+    except RuntimeError:
+        return
+    _gallery_tasks.add(task)
+    task.add_done_callback(_gallery_tasks.discard)
+
+
 RATIO_PRESETS = {
     "竖": (832, 1216), "portrait": (832, 1216), "2:3": (832, 1216),
     "方": (1024, 1024), "square": (1024, 1024), "1:1": (1024, 1024),
@@ -809,10 +917,11 @@ async def cmd_draw(
     yield CmdCtl.message("🎨 正在绘制中，请稍候...")
 
     try:
-        image_data = await _call_txt2img(prompt=clean_prompt.strip(), width=width, height=height)
+        image_data, draw_info = await _call_txt2img(prompt=clean_prompt.strip(), width=width, height=height)
     except Exception as exc:
         yield CmdCtl.failed(f"NovelAI 画图失败: {exc}")
         return
+    _schedule_gallery_upload(image_data, draw_info)
     try:
         abs_path = _save_generated(image_data, _chat_key_of(context), prompt, width, height)
         yield CmdCtl.success([
@@ -852,10 +961,11 @@ async def cmd_redraw(
     height = height or last.get("height", 0)
     yield CmdCtl.message("🎨 正在重画，请稍候...")
     try:
-        image_data = await _call_txt2img(prompt=clean_prompt.strip(), width=width, height=height)
+        image_data, draw_info = await _call_txt2img(prompt=clean_prompt.strip(), width=width, height=height)
     except Exception as exc:
         yield CmdCtl.failed(f"NovelAI 重画失败: {exc}")
         return
+    _schedule_gallery_upload(image_data, draw_info)
     try:
         abs_path = _save_generated(image_data, chat_key, prompt, width, height)
         yield CmdCtl.success([
@@ -981,6 +1091,136 @@ async def cmd_list_styles(context: CommandExecutionContext) -> AsyncIterator[Com
 
 
 @plugin.mount_command(
+    name="生成画图密钥",
+    description="生成一把画廊画图密钥（管理员）",
+    aliases=["生成密钥"],
+    permission=CommandPermission.SUPER_USER,
+    usage="生成画图密钥 [NAI5次数]",
+)
+async def cmd_generate_gallery_key(
+    context: CommandExecutionContext,
+    limit: Annotated[str, Arg("NAI5 次数", positional=True)] = "",
+) -> AsyncIterator[CommandResponse]:
+    """在图库网站生成一把随机画图密钥，默认 100 次 NAI5 额度。"""
+    count = 100
+    if limit.strip():
+        try:
+            count = max(1, int(limit.strip()))
+        except ValueError:
+            yield CmdCtl.failed("次数必须是数字，例：/生成画图密钥 100")
+            return
+    with _keys_lock:
+        keys = _load_draw_keys()
+        kid = _secrets.token_hex(4)
+        while any(k.get("kid") == kid for k in keys):
+            kid = _secrets.token_hex(4)
+        key = "lx" + _secrets.token_hex(6)
+        while any(k.get("key") == key for k in keys):
+            key = "lx" + _secrets.token_hex(6)
+        keys.append({
+            "kid": kid,
+            "key": key,
+            "limit": count,
+            "used": 0,
+            "created": _time.strftime("%Y-%m-%d %H:%M"),
+        })
+        try:
+            _save_draw_keys(keys)
+        except OSError as exc:
+            yield CmdCtl.failed(f"密钥文件写入失败: {exc}")
+            return
+    yield CmdCtl.success(
+        "🎨 新画图密钥已生成\n\n"
+        f"密钥：{key}\n"
+        f"NAI5 可用次数：{count}\n\n"
+        "在图库网站登录页输入该密钥即可获得画图权限。\n"
+        "（仅 NAI5 系列模型计次，其它模型不计数）"
+    )
+
+
+@plugin.mount_command(
+    name="增加画图次数",
+    description="给指定画图密钥增加 NAI5 次数（管理员）",
+    permission=CommandPermission.SUPER_USER,
+    usage="增加画图次数 <密钥> <次数>",
+)
+async def cmd_add_gallery_key_quota(
+    context: CommandExecutionContext,
+    key: Annotated[str, Arg("密钥", positional=True)] = "",
+    count: Annotated[str, Arg("次数", positional=True)] = "",
+) -> AsyncIterator[CommandResponse]:
+    if not key.strip() or not count.strip():
+        yield CmdCtl.failed("用法：/增加画图次数 <密钥> <次数>")
+        return
+    try:
+        amount = max(1, int(count.strip()))
+    except ValueError:
+        yield CmdCtl.failed("次数必须是数字")
+        return
+    with _keys_lock:
+        keys = _load_draw_keys()
+        entry = next((k for k in keys if k.get("key") == key.strip()), None)
+        if entry is None:
+            yield CmdCtl.failed("未找到该密钥，请用 /画图密钥列表 查看")
+            return
+        entry["limit"] = int(entry.get("limit", 0) or 0) + amount
+        left = _key_left(entry)
+        try:
+            _save_draw_keys(keys)
+        except OSError as exc:
+            yield CmdCtl.failed(f"密钥文件写入失败: {exc}")
+            return
+    yield CmdCtl.success(f"✅ 密钥 {key.strip()} 已增加 {amount} 次，当前 NAI5 剩余 {left} 次")
+
+
+@plugin.mount_command(
+    name="画图密钥列表",
+    description="查看画廊画图密钥及剩余次数（管理员）",
+    permission=CommandPermission.SUPER_USER,
+    usage="画图密钥列表",
+)
+async def cmd_list_gallery_keys(context: CommandExecutionContext) -> AsyncIterator[CommandResponse]:
+    keys = _load_draw_keys()
+    if not keys:
+        yield CmdCtl.message("暂无画图密钥，用 /生成画图密钥 创建")
+        return
+    lines = [f"🗝 画图密钥列表（共 {len(keys)} 个）"]
+    for entry in keys:
+        exhausted = "" if _key_left(entry) > 0 else "（已用完）"
+        lines.append(
+            f"- {entry.get('key')}  NAI5 剩余 {_key_left(entry)}/{int(entry.get('limit', 0) or 0)}{exhausted}"
+        )
+    yield CmdCtl.message("\n".join(lines))
+
+
+@plugin.mount_command(
+    name="删除画图密钥",
+    description="删除指定画图密钥（管理员）",
+    permission=CommandPermission.SUPER_USER,
+    usage="删除画图密钥 <密钥>",
+)
+async def cmd_delete_gallery_key(
+    context: CommandExecutionContext,
+    key: Annotated[str, Arg("密钥", positional=True)] = "",
+) -> AsyncIterator[CommandResponse]:
+    if not key.strip():
+        yield CmdCtl.failed("用法：/删除画图密钥 <密钥>")
+        return
+    with _keys_lock:
+        keys = _load_draw_keys()
+        remain = [k for k in keys if k.get("key") != key.strip()]
+        if len(remain) == len(keys):
+            yield CmdCtl.failed("未找到该密钥")
+            return
+        try:
+            _save_draw_keys(remain)
+        except OSError as exc:
+            yield CmdCtl.failed(f"密钥文件写入失败: {exc}")
+            return
+    yield CmdCtl.success(f"✅ 密钥 {key.strip()} 已删除（已登录的会话需等其过期）")
+
+
+@plugin.mount_command(
     name="拉黑",
     description="禁止某个 QQ 号或群使用本插件画图（管理员）",
     aliases=["加入黑名单"],
@@ -1059,47 +1299,194 @@ async def cmd_blacklist_list(context: CommandExecutionContext) -> AsyncIterator[
     yield CmdCtl.message("\n".join(lines))
 
 
+# ---------------------------------------------------------------------------
+# /反推（看参数）取图逻辑
+#
+# Nekro 的命令上下文（CommandExecutionContext）不携带原始消息段，命令链路
+# （collector._try_handle_command -> execute_command）只传文本参数，因此仿照
+# gpt_image 插件的做法：在 collector 层包一层，把触发命令的 platform_message
+# 存入 ContextVar 供命令处理时读取；取不到时再回退到聊天记录里最近带图的消息。
+# ---------------------------------------------------------------------------
+
+_current_command_message: ContextVar[Optional[Any]] = ContextVar(
+    "novelai_current_command_message",
+    default=None,
+)
+
+
+def _install_command_message_context_patch() -> None:
+    """让命令处理函数能拿到触发命令的原始 platform_message。"""
+    try:
+        from nekro_agent.adapters.interface import collector
+    except Exception as exc:
+        logger.debug(f"跳过命令消息上下文补丁: {exc}")
+        return
+
+    original = getattr(collector, "_try_handle_command", None)
+    if not original:
+        return
+    if getattr(original, "__novelai_ctx_wrapped__", False):
+        original = getattr(original, "__novelai_ctx_original__", original)
+
+    async def _wrapped_try_handle_command(adapter, chat_key, platform_channel, platform_user, platform_message, content_text):
+        token = _current_command_message.set({
+            "chat_key": chat_key,
+            "user_id": getattr(platform_user, "user_id", ""),
+            "platform_message": platform_message,
+            "content_text": content_text,
+        })
+        try:
+            return await original(adapter, chat_key, platform_channel, platform_user, platform_message, content_text)
+        finally:
+            _current_command_message.reset(token)
+
+    setattr(_wrapped_try_handle_command, "__novelai_ctx_wrapped__", True)
+    setattr(_wrapped_try_handle_command, "__novelai_ctx_original__", original)
+    collector._try_handle_command = _wrapped_try_handle_command
+
+
+_install_command_message_context_patch()
+
+
+def _segment_type_of(segment: Any) -> str:
+    seg_type = segment.get("type", "") if isinstance(segment, dict) else getattr(segment, "type", "")
+    if hasattr(seg_type, "value"):
+        seg_type = seg_type.value
+    return str(seg_type)
+
+
+def _segment_field(segment: Any, name: str) -> str:
+    value = segment.get(name, "") if isinstance(segment, dict) else getattr(segment, name, "")
+    return str(value or "").strip()
+
+
+async def _load_image_bytes(local_path: str, remote_url: str) -> Optional[bytes]:
+    if local_path:
+        try:
+            return Path(local_path.removeprefix("file:")).read_bytes()
+        except Exception as exc:
+            logger.debug(f"读取本地图片失败 {local_path}: {exc}")
+    if remote_url:
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(remote_url)
+                resp.raise_for_status()
+                return resp.content
+        except Exception as exc:
+            logger.debug(f"下载图片失败 {remote_url[:128]}: {exc}")
+    return None
+
+
+def _message_ref_id(message: Any) -> str:
+    """从 PlatformMessage / DBChatMessage / dict 里取被引用消息 ID。"""
+    ext_obj = getattr(message, "ext_data_obj", None)
+    if ext_obj is not None:
+        try:
+            return str(getattr(ext_obj, "ref_msg_id", "") or "")
+        except Exception:
+            pass
+    ext_data = getattr(message, "ext_data", None)
+    if ext_data is None:
+        return ""
+    if hasattr(ext_data, "ref_msg_id"):
+        return str(getattr(ext_data, "ref_msg_id", "") or "")
+    if isinstance(ext_data, dict):
+        return str(ext_data.get("ref_msg_id") or "")
+    return ""
+
+
+async def _image_bytes_from_message(message: Any) -> Optional[bytes]:
+    content_data = getattr(message, "content_data", None)
+    if isinstance(content_data, str):
+        try:
+            content_data = message.parse_content_data()
+        except Exception:
+            content_data = []
+    for segment in content_data or []:
+        if _segment_type_of(segment) != "image":
+            continue
+        image_bytes = await _load_image_bytes(
+            _segment_field(segment, "local_path"),
+            _segment_field(segment, "remote_url"),
+        )
+        if image_bytes:
+            return image_bytes
+    return None
+
+
+async def _referenced_db_message(chat_key: str, ref_msg_id: str) -> Optional[Any]:
+    if not ref_msg_id:
+        return None
+    try:
+        from nekro_agent.models.db_chat_message import DBChatMessage
+        return await DBChatMessage.filter(
+            chat_key=chat_key,
+            message_id=ref_msg_id,
+        ).order_by("-id").first()
+    except Exception as exc:
+        logger.warning(f"查询引用消息 {ref_msg_id} 失败: {exc}")
+        return None
+
+
+async def _latest_db_image_bytes(chat_key: str) -> Optional[bytes]:
+    """兜底：取频道内 24h 内最近一条带图消息的图片。"""
+    try:
+        from nekro_agent.models.db_chat_message import DBChatMessage
+        since = int(_time.time()) - 86400
+        rows = await DBChatMessage.filter(
+            chat_key=chat_key, is_recalled=False, send_timestamp__gte=since,
+        ).order_by("-id").limit(50)
+    except Exception as exc:
+        logger.warning(f"查询最近聊天记录失败: {exc}")
+        return None
+    for row in rows:
+        image_bytes = await _image_bytes_from_message(row)
+        if image_bytes:
+            return image_bytes
+    return None
+
+
+async def _resolve_metadata_image_bytes(context: CommandExecutionContext) -> tuple[Optional[bytes], str]:
+    """返回 (图片字节, 来源说明)。
+
+    优先级：命令消息自带图 > 其引用消息带图 > 最近聊天图片。
+    """
+    chat_key = _chat_key_of(context)
+    command_message = None
+    current = _current_command_message.get()
+    if current and current.get("chat_key") == chat_key and str(current.get("user_id")) == str(context.user_id):
+        command_message = current.get("platform_message")
+
+    if command_message is not None:
+        image_bytes = await _image_bytes_from_message(command_message)
+        if image_bytes:
+            return image_bytes, "命令消息"
+        ref_msg_id = _message_ref_id(command_message)
+        if ref_msg_id:
+            ref_message = await _referenced_db_message(chat_key, ref_msg_id)
+            if ref_message is not None:
+                image_bytes = await _image_bytes_from_message(ref_message)
+                if image_bytes:
+                    return image_bytes, "引用消息"
+
+    return await _latest_db_image_bytes(chat_key), "最近聊天图片"
+
+
 @plugin.mount_command(
     name="看参数",
     description="提取 NovelAI 图片的生成参数（PNG 元数据）",
     aliases=["反推", "查看参数", "naimeta"],
     permission=CommandPermission.PUBLIC,
-    usage="看参数 (回复一张图片)",
+    usage="看参数 (回复一张图片，或 图片+反推 同发，或画图后直接使用)",
 )
 async def cmd_metadata(
     context: CommandExecutionContext,
     prompt: Annotated[str, Arg("提示", positional=True, greedy=True)] = "",
 ) -> AsyncIterator[CommandResponse]:
-    image_url = None
-    if hasattr(context, "event") and context.event:
-        event = context.event
-        for seg in getattr(event, "message", []):
-            seg_data = seg if isinstance(seg, dict) else (seg.data if hasattr(seg, "data") else {})
-            seg_type = seg.get("type", "") if isinstance(seg, dict) else getattr(seg, "type", "")
-            if seg_type == "image":
-                image_url = seg_data.get("url") or seg_data.get("file")
-                break
-            if seg_type == "reply":
-                reply_msg = getattr(event, "reply", None)
-                if reply_msg and hasattr(reply_msg, "message"):
-                    for rseg in reply_msg.message:
-                        rd = rseg if isinstance(rseg, dict) else (rseg.data if hasattr(rseg, "data") else {})
-                        rt = rseg.get("type", "") if isinstance(rseg, dict) else getattr(rseg, "type", "")
-                        if rt == "image":
-                            image_url = rd.get("url") or rd.get("file")
-                            break
-    img_bytes = None
-    if image_url:
-        yield CmdCtl.message("正在提取图片参数...")
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.get(image_url)
-                resp.raise_for_status()
-                img_bytes = resp.content
-        except Exception as exc:
-            yield CmdCtl.failed(f"下载图片失败: {exc}")
-            return
-    else:
+    img_bytes, source = await _resolve_metadata_image_bytes(context)
+    if img_bytes is not None:
+        yield CmdCtl.message(f"正在提取图片参数...（来源: {source}）")
+    if img_bytes is None:
         chat_key = _chat_key_of(context)
         last = _last_draw.get(chat_key)
         if last and last.get("image_path"):
@@ -1108,9 +1495,9 @@ async def cmd_metadata(
                 yield CmdCtl.message("正在提取上一张画图的参数...")
             except FileNotFoundError:
                 pass
-        if img_bytes is None:
-            yield CmdCtl.failed("请回复一张图片，或在画图后直接使用本命令查看参数。")
-            return
+    if img_bytes is None:
+        yield CmdCtl.failed("请回复一张图片，或发一条「图片+/反推」，或在画图后直接使用本命令查看参数。")
+        return
     metadata = _extract_png_metadata(img_bytes)
     if not metadata:
         yield CmdCtl.failed("未能从该图片中提取到 NovelAI 元数据。可能不是 NAI 生成的图片。")
@@ -1546,7 +1933,8 @@ async def novelai_generate(
     if blocked:
         return f"画图功能已对{blocked}禁用（黑名单），无法生成图片。不要再尝试调用画图工具，直接告知用户被管理员禁用了。"
     width, height = _parse_size(size)
-    image_data = await _call_txt2img(prompt=prompt, width=width, height=height, model=model, negative_prompt=negative_prompt)
+    image_data, draw_info = await _call_txt2img(prompt=prompt, width=width, height=height, model=model, negative_prompt=negative_prompt)
+    _schedule_gallery_upload(image_data, draw_info)
     path = await _forward_result(_ctx, image_data)
     if send_to_chat:
         await _ctx.send_image(path)
@@ -1599,10 +1987,11 @@ async def novelai_img2img(
     image_bytes = ref_path.read_bytes()
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     width, height = _parse_size(size)
-    image_data = await _call_img2img(
+    image_data, draw_info = await _call_img2img(
         prompt=prompt, image_b64=image_b64, width=width, height=height,
         strength=strength, noise=noise, model=model, negative_prompt=negative_prompt,
     )
+    _schedule_gallery_upload(image_data, draw_info)
     path = await _forward_result(_ctx, image_data)
     if send_to_chat:
         await _ctx.send_image(path)
