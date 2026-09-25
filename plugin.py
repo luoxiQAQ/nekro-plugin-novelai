@@ -45,7 +45,7 @@ _plugin_kwargs: dict = dict(
     name="NovelAI 画图",
     module_name="novelai",
     description="NovelAI 文生图/图生图插件，支持 NAI v3/v4/v4.5/v5 模型。",
-    version="1.3.0",
+    version="1.4.0",
     author="luoxi",
     url="",
     i18n_name=i18n.i18n_text(zh_CN="NovelAI 画图", en_US="NovelAI Image"),
@@ -156,6 +156,11 @@ class NovelAIConfig(ConfigBase):
         title="翻译大模型",
         description="用于将中文提示词翻译为英文 danbooru 标签的聊天模型组。留空则不翻译。",
         json_schema_extra=ExtraField(ref_model_groups=True, required=False, model_type="chat").model_dump(),
+    )
+    TRANSLATE_MODEL_NAME: str = Field(
+        default="",
+        title="翻译模型名",
+        description="覆盖模型组里的对话模型（如 gemini-3-flash）。留空则用模型组配置中的 CHAT_MODEL。",
     )
     GALLERY_UPLOAD_URL: str = Field(
         default="",
@@ -570,7 +575,7 @@ async def _translate_prompt(prompt: str) -> str:
         mg = global_config.MODEL_GROUPS[group_key]
         api_key = str(getattr(mg, "API_KEY", ""))
         base_url = str(getattr(mg, "BASE_URL", ""))
-        chat_model = str(getattr(mg, "CHAT_MODEL", ""))
+        chat_model = config.TRANSLATE_MODEL_NAME.strip() or str(getattr(mg, "CHAT_MODEL", ""))
         if not api_key or not base_url:
             logger.warning("NovelAI 翻译: 模型组缺少 API_KEY 或 BASE_URL，跳过翻译")
             return prompt
