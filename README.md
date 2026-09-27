@@ -1,6 +1,6 @@
 # NovelAI 画图插件 (Nekro Agent)
 
-适用于 [Nekro Agent](https://github.com/KroMiose/nekro-agent) 的 NovelAI 文生图/图生图插件，支持 NAI v3/v4/v4.5/v5 模型。
+适用于 [Nekro Agent](https://github.com/KroMiose/nekro-agent) 的 NovelAI 文生图/图生图插件，通过 Nekro 模型组以 OpenAI 兼容生图接口（`/images/generations`、`/images/edits`）调用画图模型。
 
 ## ✨ 功能一览
 
@@ -9,7 +9,7 @@
 - **文生图** — 支持中文描述，自动翻译为英文 danbooru 标签
 - **图生图** — 通过 Sandbox Tool 由 LLM 代理自动调用
 - **尺寸控制** — 在描述末尾加 `竖`（832×1216）、`横`（1216×832）、`方`（1024×1024）即可切换
-- **多模型支持** — NAI v3 / v4 / v4.5 / v5，v4+ 自动使用 `v4_prompt` 结构
+- **多模型支持** — 通过画图模型组的模型名切换（如 `jw-nai-diffusion-4-5-full`、`nai-diffusion-5-full@岸`），支持网关上挂载的任意 NAI 系模型
 
 ### 🎭 预设系统
 
@@ -90,16 +90,18 @@
 - 点击「编辑」回填表单修改，点击「删除」移除
 - 实时生效，保存后立即可在画图指令中引用
 
-### 🔑 多 Token 轮切
+### 🔌 画图模型组调用（对齐 gpt-image 插件）
 
-在插件配置中填入多个 NovelAI API Token（逗号分隔），遇到 401/402/429 错误时自动轮切到下一个 Token 重试，提高可用性。
+画图请求通过 Nekro **模型组** 发出：插件从所选模型组读取 `BASE_URL` 与 `API_KEY`，调用 OpenAI 兼容接口——文生图 `POST {BASE_URL}/images/generations`，图生图 multipart `POST {BASE_URL}/images/edits`，响应取 `b64_json`（兜底 `url` 下载）。凭据统一在 Nekro 模型组里管理，插件不再保存 NovelAI Token。
+
+> **注意**：负面提示词 / 步数 / 权重等采样参数是否生效取决于网关 adaptor 的实现（有些网关只透传提示词和尺寸，其余参数用内置默认值）；图生图 `/images/edits` 也需要网关渠道支持。
 
 ### 🤖 Sandbox Tool
 
 插件向 Nekro Agent 的 LLM 沙盒暴露了两个工具函数：
 
 - **NovelAI 文生图** — `novelai_generate(prompt, size, negative_prompt, model, send_to_chat)`
-- **NovelAI 图生图** — `novelai_img2img(image_path, prompt, size, strength, noise, ...)`
+- **NovelAI 图生图** — `novelai_img2img(image_path, prompt, size, negative_prompt, model, send_to_chat)`
 
 LLM 可以在对话中根据用户意图自动调用这些工具画图，无需用户手动输入命令。
 
@@ -129,20 +131,13 @@ LLM 可以在对话中根据用户意图自动调用这些工具画图，无需�
 
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
-| API Token | NovelAI API Token，支持多个用逗号分隔 | — |
-| API 反代地址 | 替换官方 API 地址，留空使用官方 | — |
-| HTTP 代理 | HTTP/SOCKS5 代理地址 | — |
-| 模型 | 默认使用的 NAI 模型 | `nai-diffusion-4-5-full` |
+| 画图模型组 | 提供画图模型的 Nekro 模型组（取其 BASE_URL 与 API_KEY 调用 OpenAI 兼容生图接口） | — |
+| 画图模型名 | 发送给网关的模型名（如 `jw-nai-diffusion-4-5-full`），留空使用模型组里配置的模型 | — |
 | 分辨率 | 默认图片分辨率 | `832x1216` |
-| 步数 | 采样步数 (1-50) | `28` |
-| 权重 | CFG Scale 引导权重 (1-20) | `7` |
-| 引导缩放 | CFG Rescale (0.0-1.0) | `0.0` |
-| 采样器 | 默认采样器 | `k_euler` |
-| 负面提示词 | 全局负面提示词 | — |
-| 图生图强度 | img2img 强度 (0.1-0.9) | `0.5` |
-| 图生图噪声 | img2img 噪声 (0.0-1.0) | `0.2` |
-| R18 开关 | 开启后允许 NSFW 内容 | `关闭` |
+| 负面提示词 | 随请求发送的负面提示词（网关 adaptor 不支持时会被忽略） | — |
+| R18 开关 | 关闭时在负面提示词中追加 NSFW 过滤标签（生效与否取决于网关 adaptor） | `关闭` |
 | 翻译模型 | 中文→英文标签翻译的聊天模型组 | — |
+| 图库上传地址 / 密钥 | 画完图自动上传图库网站的接口与密钥 | — |
 | 画图黑名单 | 禁止使用画图的 QQ 号/群号，每行一个（也可用 `/拉黑` 等命令管理） | — |
 
 ## 📦 安装
@@ -152,7 +147,7 @@ cd /path/to/nekro_agent/plugins/packages/
 git clone https://github.com/luoxiQAQ/nekro-plugin-novelai.git nekro_plugin_novelai
 ```
 
-重启 Nekro Agent，在管理面板中配置 API Token 即可使用。
+重启 Nekro Agent，在管理面板的插件配置中选择**画图模型组**（并按需填写画图模型名）即可使用。
 
 ### 导入预设
 

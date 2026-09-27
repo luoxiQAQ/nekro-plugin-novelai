@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import time as _time
 import base64
 import io
@@ -7,7 +7,6 @@ import random
 import re
 import secrets as _secrets
 import threading
-import zipfile
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Annotated, Any, AsyncIterator, Dict, List, Literal, Optional
@@ -44,14 +43,14 @@ import inspect as _inspect
 _plugin_kwargs: dict = dict(
     name="NovelAI 画图",
     module_name="novelai",
-    description="NovelAI 文生图/图生图插件，支持 NAI v3/v4/v4.5/v5 模型。",
-    version="1.3.0",
+    description="NovelAI 文生图/图生图插件，通过 Nekro 模型组以 OpenAI 兼容生图接口调用画图模型。",
+    version="1.4.0",
     author="luoxi",
     url="",
     i18n_name=i18n.i18n_text(zh_CN="NovelAI 画图", en_US="NovelAI Image"),
     i18n_description=i18n.i18n_text(
-        zh_CN="NovelAI 文生图/图生图插件，支持 NAI v3/v4/v4.5/v5 模型，内置翻译和 R18 开关。",
-        en_US="NovelAI text-to-image and image-to-image plugin with translation and R18 toggle.",
+        zh_CN="NovelAI 文生图/图生图插件，通过 Nekro 模型组以 OpenAI 兼容生图接口调用画图模型，内置翻译和 R18 开关。",
+        en_US="NovelAI text-to-image and image-to-image plugin calling image models via a Nekro model group, with translation and R18 toggle.",
     ),
     webui_path="/",
     allow_sleep=True,
@@ -61,30 +60,11 @@ _init_sig = _inspect.signature(NekroPlugin.__init__)
 _plugin_kwargs = {k: v for k, v in _plugin_kwargs.items() if k in _init_sig.parameters}
 plugin = NekroPlugin(**_plugin_kwargs)
 
-NAI_API_BASE = "https://image.novelai.net"
-
-MODEL_CHOICES = Literal[
-    "nai-diffusion-5-full",
-    "nai-diffusion-5-curated",
-    "nai-diffusion-4-5-full",
-    "nai-diffusion-4-5-curated",
-]
-
 RESOLUTION_CHOICES = Literal[
     "832x1216",
     "1216x832",
     "1024x1024",
 ]
-
-V4_STYLE_MODELS = {
-    "nai-diffusion-4", "nai-diffusion-4-curated-preview",
-    "nai-diffusion-4.5-full", "nai-diffusion-4-5-full", "nai-diffusion-4-5-curated",
-    "nai-diffusion-5-full", "nai-diffusion-5-curated",
-}
-
-
-def _is_v4_style(model: str) -> bool:
-    return model.lower() in V4_STYLE_MODELS
 
 
 def _model_label(model: str) -> str:
@@ -98,58 +78,34 @@ def _model_label(model: str) -> str:
     return "v3"
 
 
-def _create_v4_prompt(prompt: str) -> dict:
-    return {
-        "caption": {"base_caption": prompt, "char_captions": [], "scenery_captions": []},
-        "use_coords": False,
-        "use_order": True,
-    }
-
-
 @plugin.mount_config()
 class NovelAIConfig(ConfigBase):
-    API_TOKEN: str = Field(
+    MODEL_GROUP: str = Field(
         default="",
-        title="NovelAI API Token",
-        description="NovelAI API Token，支持多个用逗号分隔，自动轮切。",
-        json_schema_extra=ExtraField(is_secret=True).model_dump(),
+        title="画图模型组",
+        description="提供画图模型的模型组：取其 BASE_URL 与 API_KEY，调用 OpenAI 兼容的 /images/generations（文生图）与 /images/edits（图生图）接口，与 gpt-image 插件同款调用方式。",
+        json_schema_extra=ExtraField(ref_model_groups=True, required=False).model_dump(),
     )
-    API_PROXY: str = Field(
+    DEFAULT_MODEL: str = Field(
         default="",
-        title="API 反代地址",
-        description="NovelAI API 反向代理地址（替换 https://image.novelai.net），留空使用官方地址。",
-    )
-    HTTP_PROXY: str = Field(
-        default="",
-        title="HTTP 代理",
-        description="HTTP/SOCKS5 代理地址，留空不使用代理。",
-    )
-    DEFAULT_MODEL: MODEL_CHOICES = Field(
-        default="nai-diffusion-4-5-full",
-        title="模型",
-        description="默认使用的 NovelAI 模型。",
+        title="画图模型名",
+        description="发送给网关的模型名（如 jw-nai-diffusion-4-5-full、nai-diffusion-5-full@岸）。留空使用画图模型组里配置的模型名。",
     )
     DEFAULT_RESOLUTION: RESOLUTION_CHOICES = Field(
         default="832x1216",
         title="分辨率",
         description="默认图片分辨率。",
     )
-    DEFAULT_STEPS: int = Field(default=28, title="步数 (1-50)", description="默认采样步数。", ge=1, le=50)
-    DEFAULT_SCALE: int = Field(default=7, title="权重 (1-20)", description="默认 CFG Scale 引导权重。", ge=1, le=20)
-    CFG_RESCALE: float = Field(default=0.0, title="引导缩放参数(0.0-1.0)", description="CFG Rescale 参数。", ge=0.0, le=1.0)
-    DEFAULT_SAMPLER: str = Field(default="k_euler", title="默认采样器", description="默认采样器名称。")
     NEGATIVE_PROMPT: str = Field(
         default="",
         title="负面提示词",
-        description="全局负面提示词，留空使用默认。",
+        description="随请求发送的负面提示词（网关 adaptor 不支持时会被忽略，使用其内置默认值）。",
         json_schema_extra=ExtraField(is_textarea=True).model_dump(),
     )
-    IMG2IMG_STRENGTH: float = Field(default=0.5, title="图生图强度", description="图生图强度 (0.1-0.9)。", ge=0.1, le=0.9)
-    IMG2IMG_NOISE: float = Field(default=0.2, title="图生图噪声", description="图生图噪声 (0.0-1.0)。", ge=0.0, le=1.0)
     ENABLE_R18: bool = Field(
         default=False,
         title="R18 画图开关",
-        description="开启后允许生成 R18 内容。关闭时自动在负面提示词中添加 NSFW 过滤标签。",
+        description="关闭时会在负面提示词中追加 NSFW 过滤标签（过滤是否生效取决于网关 adaptor）。",
     )
     TRANSLATE_MODEL_GROUP: str = Field(
         default="",
@@ -158,14 +114,14 @@ class NovelAIConfig(ConfigBase):
         json_schema_extra=ExtraField(ref_model_groups=True, required=False, model_type="chat").model_dump(),
     )
     GALLERY_UPLOAD_URL: str = Field(
-        default="",
+        default="https://pic.luoxi.fun/api/upload",
         title="图库上传地址",
         description="画完图自动上传到图库网站的接口地址。留空或未填密钥则不启用。",
     )
     GALLERY_UPLOAD_KEY: str = Field(
         default="",
         title="图库上传密钥",
-        description="图库网站的上传密钥。",
+        description="图库网站的上传密钥（服务器上 /opt/astrbot-gallery/state/upload_key 的内容）。",
         json_schema_extra=ExtraField(is_secret=True).model_dump(),
     )
     DRAW_BLACKLIST: str = Field(
@@ -177,8 +133,6 @@ class NovelAIConfig(ConfigBase):
 
 
 config: NovelAIConfig = plugin.get_config(NovelAIConfig)
-
-_token_index = 0
 
 PRESET_KIND_LABELS = {"characters": "人物", "styles": "风格"}
 
@@ -301,7 +255,7 @@ class PresetStore:
 
 preset_store = PresetStore()
 
-# 画廊画图密钥库：与图库网站共用同一份文件，图库每 NAI5 次生成会回写 used
+# 画廊画图密钥库：与 pic.luoxi.fun 共用同一份文件，图库每 NAI5 次生成会回写 used
 GALLERY_KEYS_PATH = plugin.get_plugin_data_dir() / "gallery_draw_keys.json"
 _keys_lock = threading.RLock()
 
@@ -415,56 +369,35 @@ Rules:
 8. Do NOT add NSFW tags unless explicitly requested"""
 
 
-def _get_tokens() -> list:
-    raw = config.API_TOKEN or ""
-    return [t.strip() for t in re.split(r"[,;\n]+", raw) if t.strip()]
+def _get_draw_model_group():
+    """取画图模型组配置（gpt-image 插件同款方式），返回模型组对象。"""
+    group_key = (config.MODEL_GROUP or "").strip()
+    if not group_key:
+        raise ValueError("画图模型组未配置，请在插件设置中选择画图模型组。")
+    from nekro_agent.core.config import config as global_config
+    if group_key not in global_config.MODEL_GROUPS:
+        raise ValueError(f"画图模型组 `{group_key}` 未在 Nekro Agent 中配置")
+    mg = global_config.MODEL_GROUPS[group_key]
+    if not str(getattr(mg, "BASE_URL", "")).strip():
+        raise ValueError(f"画图模型组 `{group_key}` 缺少 BASE_URL")
+    if not str(getattr(mg, "API_KEY", "")).strip():
+        raise ValueError(f"画图模型组 `{group_key}` 缺少 API_KEY")
+    return mg
 
 
-def _get_current_token() -> str:
-    global _token_index
-    tokens = _get_tokens()
-    if not tokens:
-        raise ValueError("NovelAI Token 未配置，请在插件设置中填写 API_TOKEN。")
-    _token_index = _token_index % len(tokens)
-    return tokens[_token_index]
-
-
-def _rotate_token(reason: str) -> bool:
-    global _token_index
-    tokens = _get_tokens()
-    if len(tokens) <= 1:
-        return False
-    _token_index = (_token_index + 1) % len(tokens)
-    logger.warning(f"NovelAI Token 轮切: {reason} -> 第 {_token_index + 1}/{len(tokens)} 个")
-    return True
-
-
-def _get_api_url(endpoint: str = "generate-image") -> str:
-    if config.API_PROXY:
-        return f"{config.API_PROXY.rstrip('/')}/ai/{endpoint}"
-    return f"{NAI_API_BASE}/ai/{endpoint}"
+def _get_model_name(model_group, model: str = "") -> str:
+    name = (model or config.DEFAULT_MODEL or "").strip()
+    if not name:
+        name = str(getattr(model_group, "CHAT_MODEL", "") or "").strip()
+    if not name:
+        raise ValueError("画图模型名未配置：请填写插件「画图模型名」，或在画图模型组中设置模型。")
+    return name
 
 
 def _parse_resolution() -> tuple:
     res = config.DEFAULT_RESOLUTION or "832x1216"
     m = re.match(r"(\d+)[xX×](\d+)", res)
     return (int(m.group(1)), int(m.group(2))) if m else (832, 1216)
-
-
-def _build_client_config() -> dict:
-    cfg: dict = {"timeout": httpx.Timeout(90.0, connect=30.0), "limits": httpx.Limits(max_keepalive_connections=2, max_connections=3)}
-    if config.HTTP_PROXY:
-        cfg["proxy"] = config.HTTP_PROXY
-    return cfg
-
-
-def _build_headers() -> dict:
-    return {
-        "Authorization": f"Bearer {_get_current_token()}",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Connection": "close",
-    }
 
 
 def _get_negative_prompt(extra: str = "") -> str:
@@ -476,23 +409,6 @@ def _get_negative_prompt(extra: str = "") -> str:
     if extra:
         parts.append(extra)
     return ", ".join(parts)
-
-
-def _build_parameters(prompt, width, height, steps, scale, sampler, model, negative_prompt=""):
-    neg = _get_negative_prompt(negative_prompt)
-    params = {
-        "params_version": 3, "width": width, "height": height, "scale": scale,
-        "sampler": sampler, "steps": steps, "n_samples": 1, "ucPreset": 0,
-        "qualityToggle": True, "dynamic_thresholding": False, "controlnet_strength": 1,
-        "legacy": False, "add_original_image": False, "cfg_rescale": config.CFG_RESCALE,
-        "noise_schedule": "karras", "legacy_v3_extend": False, "skip_cfg_above_sigma": None,
-        "use_coords": False, "characterPrompts": [], "negative_prompt": neg,
-        "seed": random.randint(0, 4294967295),
-    }
-    if _is_v4_style(model):
-        params["v4_prompt"] = _create_v4_prompt(prompt)
-        params["v4_negative_prompt"] = {"caption": {"base_caption": neg, "char_captions": [], "scenery_captions": []}}
-    return params
 
 
 def _strip_png_metadata(data: bytes) -> bytes:
@@ -507,31 +423,11 @@ def _strip_png_metadata(data: bytes) -> bytes:
         return data
 
 
-def _extract_image(response_data: bytes) -> Optional[bytes]:
-    try:
-        from PIL import Image as PILImage
-        try:
-            img = PILImage.open(io.BytesIO(response_data))
-            img.close()
-            return response_data
-        except Exception:
-            pass
-    except ImportError:
-        if response_data[:4] == b"\x89PNG" or response_data[:2] == b"\xff\xd8":
-            return response_data
-    try:
-        with zipfile.ZipFile(io.BytesIO(response_data)) as zf:
-            for name in zf.namelist():
-                if name.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
-                    return zf.read(name)
-    except Exception:
-        pass
-    try:
-        data = json.loads(response_data.decode("utf-8"))
-        if "image" in data:
-            return base64.b64decode(data["image"])
-    except Exception:
-        pass
+def _decode_images_payload(data: dict) -> Optional[dict]:
+    """从 OpenAI images 响应里取第一项（b64_json 或 url，gpt-image 插件同款解析）。"""
+    items = data.get("data")
+    if isinstance(items, list) and items and isinstance(items[0], dict):
+        return items[0]
     return None
 
 
@@ -602,118 +498,116 @@ async def _translate_prompt(prompt: str) -> str:
         return prompt
 
 
-async def _call_txt2img(prompt, width=0, height=0, steps=0, scale=0, sampler="", model="", negative_prompt=""):
-    model = model or config.DEFAULT_MODEL
+_GW_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
+
+
+async def _request_gateway_image(client: httpx.AsyncClient, item: dict) -> bytes:
+    """按 gpt-image 插件的方式解析 images 响应：优先 b64_json，其次下载 url。"""
+    b64_data = str(item.get("b64_json") or "").strip()
+    if b64_data:
+        return base64.b64decode(b64_data)
+    url = str(item.get("url") or "").strip()
+    if url:
+        response = await client.get(url)
+        response.raise_for_status()
+        return response.content
+    raise Exception("画图模型接口未返回图片数据")
+
+
+async def _call_txt2img(prompt, width=0, height=0, model="", negative_prompt=""):
+    """文生图：取模型组 BASE_URL 与 API_KEY，POST /images/generations（gpt-image 插件同款调用方式）。"""
+    mg = _get_draw_model_group()
+    model_name = _get_model_name(mg, model)
     dw, dh = _parse_resolution()
     width, height = width or dw, height or dh
-    steps = steps or config.DEFAULT_STEPS
-    scale = scale or config.DEFAULT_SCALE
-    sampler = sampler or config.DEFAULT_SAMPLER
     raw_prompt = prompt
     prompt = await _translate_prompt(_expand_preset_prompt(prompt))
-    params = _build_parameters(prompt, width, height, steps, scale, sampler, model, negative_prompt)
+    negative = _get_negative_prompt(negative_prompt)
     info = {
         "raw_prompt": raw_prompt,
         "prompt": prompt,
-        "negative_prompt": _get_negative_prompt(negative_prompt),
+        "negative_prompt": negative,
         "width": width,
         "height": height,
-        "steps": steps,
-        "scale": scale,
-        "sampler": sampler,
-        "model": model,
-        "seed": params.get("seed"),
+        "model": model_name,
         "image_type": "txt2img",
+        "via": "model_group",
     }
-    payload = {"input": prompt, "model": model, "action": "generate", "parameters": params}
-    api_url = _get_api_url("generate-image")
-    max_retries = 3 if len(_get_tokens()) > 1 else 2
-    async with httpx.AsyncClient(**_build_client_config()) as client:
-        for retry in range(max_retries):
-            try:
-                if retry > 0:
-                    await asyncio.sleep(retry * 1.0)
-                headers = _build_headers()
-                response = await client.post(api_url, headers=headers, json=payload)
-                if response.status_code == 200:
-                    img = _extract_image(response.content)
-                    if img is None:
-                        raise Exception("无法从响应中提取图片")
-                    logger.info(f"NovelAI 文生图成功: model={model} ({_model_label(model)}), {width}x{height}")
-                    return img, info
-                elif response.status_code in (401, 402, 429):
-                    reason = f"HTTP {response.status_code}: {response.text[:60]}"
-                    if retry < max_retries - 1 and _rotate_token(reason):
-                        continue
-                    raise Exception(f"NovelAI API 认证/配额错误: {reason}")
-                elif response.status_code >= 500:
-                    if retry < max_retries - 1:
-                        logger.warning(f"NovelAI 服务器错误 {response.status_code}，将重试")
-                        continue
-                    raise Exception(f"NovelAI 服务器错误: {response.status_code}")
-                else:
-                    raise Exception(f"NovelAI API 错误: {response.status_code} {response.text[:200]}")
-            except httpx.RequestError as exc:
-                if retry < max_retries - 1:
-                    logger.warning(f"网络请求失败: {exc}，将重试")
-                    continue
-                raise Exception(f"NovelAI 网络错误: {exc}") from exc
-    raise Exception("NovelAI 请求失败: 超过最大重试次数")
+    payload = {
+        "model": model_name,
+        "prompt": prompt,
+        "n": 1,
+        "size": f"{width}x{height}",
+        "response_format": "b64_json",
+    }
+    if negative:
+        payload["negative_prompt"] = negative  # 网关 adaptor 不支持时会被忽略
+    api_url = f"{str(mg.BASE_URL).rstrip('/')}/images/generations"
+    async with httpx.AsyncClient(timeout=_GW_TIMEOUT) as client:
+        try:
+            response = await client.post(
+                api_url,
+                headers={"Authorization": f"Bearer {mg.API_KEY}", "Content-Type": "application/json"},
+                json=payload,
+            )
+        except httpx.RequestError as exc:
+            raise Exception(f"画图模型接口网络错误: {exc}") from exc
+        if response.status_code != 200:
+            raise Exception(f"画图模型接口错误: HTTP {response.status_code} {response.text[:200]}")
+        item = _decode_images_payload(response.json())
+        if item is None:
+            raise Exception("画图模型接口未返回图片数据")
+        image = await _request_gateway_image(client, item)
+    logger.info(f"NovelAI 文生图成功: model={model_name} ({_model_label(model_name)}), {width}x{height}")
+    return image, info
 
 
-async def _call_img2img(prompt, image_b64, width=0, height=0, steps=0, scale=0, strength=0, noise=-1, model="", negative_prompt=""):
-    model = model or config.DEFAULT_MODEL
+async def _call_img2img(prompt, image_b64, width=0, height=0, model="", negative_prompt=""):
+    """图生图：取模型组 BASE_URL 与 API_KEY，multipart POST /images/edits（gpt-image 插件同款调用方式）。"""
+    mg = _get_draw_model_group()
+    model_name = _get_model_name(mg, model)
     dw, dh = _parse_resolution()
     width, height = width or dw, height or dh
-    steps = steps or config.DEFAULT_STEPS
-    scale = scale or config.DEFAULT_SCALE
-    strength = strength or config.IMG2IMG_STRENGTH
-    noise = noise if noise >= 0 else config.IMG2IMG_NOISE
     raw_prompt = prompt
     prompt = await _translate_prompt(_expand_preset_prompt(prompt))
-    params = _build_parameters(prompt, width, height, steps, scale, config.DEFAULT_SAMPLER, model, negative_prompt)
-    params["image"] = image_b64
-    params["strength"] = strength
-    params["noise"] = noise
+    negative = _get_negative_prompt(negative_prompt)
     info = {
         "raw_prompt": raw_prompt,
         "prompt": prompt,
-        "negative_prompt": _get_negative_prompt(negative_prompt),
+        "negative_prompt": negative,
         "width": width,
         "height": height,
-        "steps": steps,
-        "scale": scale,
-        "sampler": config.DEFAULT_SAMPLER,
-        "model": model,
-        "seed": params.get("seed"),
+        "model": model_name,
         "image_type": "img2img",
-        "strength": strength,
-        "noise": noise,
+        "via": "model_group",
     }
-    payload = {"input": prompt, "model": model, "action": "img2img", "parameters": params}
-    api_url = _get_api_url("generate-image")
-    async with httpx.AsyncClient(**_build_client_config()) as client:
-        headers = _build_headers()
-        response = await client.post(api_url, headers=headers, json=payload)
-        if response.status_code == 200:
-            img = _extract_image(response.content)
-            if img is None:
-                raise Exception("无法从响应中提取图片")
-            logger.info(f"NovelAI 图生图成功: model={model}, strength={strength}, noise={noise}")
-            return img, info
-        elif response.status_code in (401, 402, 429):
-            reason = f"HTTP {response.status_code}: {response.text[:60]}"
-            if _rotate_token(reason):
-                headers = _build_headers()
-                response = await client.post(api_url, headers=headers, json=payload)
-                if response.status_code == 200:
-                    img = _extract_image(response.content)
-                    if img is None:
-                        raise Exception("无法从响应中提取图片")
-                    return img, info
-            raise Exception(f"NovelAI API 认证/配额错误: {reason}")
-        else:
-            raise Exception(f"NovelAI API 错误: {response.status_code} {response.text[:200]}")
+    fields = {
+        "model": model_name,
+        "prompt": prompt,
+        "n": "1",
+        "size": f"{width}x{height}",
+    }
+    if negative:
+        fields["negative_prompt"] = negative  # 网关 adaptor 不支持时会被忽略
+    api_url = f"{str(mg.BASE_URL).rstrip('/')}/images/edits"
+    async with httpx.AsyncClient(timeout=_GW_TIMEOUT) as client:
+        try:
+            response = await client.post(
+                api_url,
+                headers={"Authorization": f"Bearer {mg.API_KEY}", "Accept": "application/json"},
+                data=fields,
+                files=[("image", ("reference.png", base64.b64decode(image_b64), "image/png"))],
+            )
+        except httpx.RequestError as exc:
+            raise Exception(f"画图模型接口网络错误: {exc}") from exc
+        if response.status_code != 200:
+            raise Exception(f"画图模型接口错误: HTTP {response.status_code} {response.text[:200]}")
+        item = _decode_images_payload(response.json())
+        if item is None:
+            raise Exception("画图模型接口未返回图片数据")
+        image = await _request_gateway_image(client, item)
+    logger.info(f"NovelAI 图生图成功: model={model_name}, {width}x{height}")
+    return image, info
 
 
 async def _forward_result(ctx: AgentCtx, image_data: bytes, fmt: str = "png") -> str:
@@ -1101,7 +995,7 @@ async def cmd_generate_gallery_key(
     context: CommandExecutionContext,
     limit: Annotated[str, Arg("NAI5 次数", positional=True)] = "",
 ) -> AsyncIterator[CommandResponse]:
-    """在图库网站生成一把随机画图密钥，默认 100 次 NAI5 额度。"""
+    """在 pic.luoxi.fun 生成一把随机画图密钥，默认 100 次 NAI5 额度。"""
     count = 100
     if limit.strip():
         try:
@@ -1133,7 +1027,7 @@ async def cmd_generate_gallery_key(
         "🎨 新画图密钥已生成\n\n"
         f"密钥：{key}\n"
         f"NAI5 可用次数：{count}\n\n"
-        "在图库网站登录页输入该密钥即可获得画图权限。\n"
+        "在 pic.luoxi.fun 登录页输入该密钥即可获得画图权限。\n"
         "（仅 NAI5 系列模型计次，其它模型不计数）"
     )
 
@@ -1951,8 +1845,6 @@ async def novelai_img2img(
     image_path: str,
     prompt: str,
     size: str = "",
-    strength: float = 0,
-    noise: float = -1,
     negative_prompt: str = "",
     model: str = "",
     send_to_chat: bool = True,
@@ -1965,8 +1857,6 @@ async def novelai_img2img(
         image_path: 参考图片的沙盒路径（一般是用户发来的图片或沙盒中的图片文件）。
         prompt: 期望的画面描述。中文会自动翻译；支持预设名（人物/风格预设自动展开）。
         size: 输出尺寸，用法同文生图（竖/横/方 或 WIDTHxHEIGHT）。留空使用插件默认。
-        strength: 图生图强度 0.1-0.9，越大越偏离原图；0 使用插件默认。
-        noise: 图生图噪声 0.0-1.0；-1 使用插件默认。
         negative_prompt: 额外负面提示词。
         model: 模型名覆盖，留空使用插件默认。
         send_to_chat: 是否把生成结果直接发送到当前会话，默认 True。
@@ -1989,7 +1879,7 @@ async def novelai_img2img(
     width, height = _parse_size(size)
     image_data, draw_info = await _call_img2img(
         prompt=prompt, image_b64=image_b64, width=width, height=height,
-        strength=strength, noise=noise, model=model, negative_prompt=negative_prompt,
+        model=model, negative_prompt=negative_prompt,
     )
     _schedule_gallery_upload(image_data, draw_info)
     path = await _forward_result(_ctx, image_data)
