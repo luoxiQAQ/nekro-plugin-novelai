@@ -917,7 +917,14 @@ async def cmd_draw(
     yield CmdCtl.message("🎨 正在绘制中，请稍候...")
 
     try:
-        image_data, draw_info = await _call_txt2img(prompt=clean_prompt.strip(), width=width, height=height)
+        ref_image = await _resolve_draw_reference_image(context)
+        if ref_image is not None:
+            image_data, draw_info = await _call_img2img(
+                prompt=clean_prompt.strip(), image_b64=base64.b64encode(ref_image).decode("utf-8"),
+                width=width, height=height,
+            )
+        else:
+            image_data, draw_info = await _call_txt2img(prompt=clean_prompt.strip(), width=width, height=height)
     except Exception as exc:
         yield CmdCtl.failed(f"NovelAI 画图失败: {exc}")
         return
@@ -1470,6 +1477,26 @@ async def _resolve_metadata_image_bytes(context: CommandExecutionContext) -> tup
                     return image_bytes, "引用消息"
 
     return await _latest_db_image_bytes(chat_key), "最近聊天图片"
+
+
+async def _resolve_draw_reference_image(context: CommandExecutionContext) -> Optional[bytes]:
+    """返回命令消息自身或其所引用消息中的参考图片；不做最近聊天图片兜底，避免误触发图生图。"""
+    chat_key = _chat_key_of(context)
+    current = _current_command_message.get()
+    command_message = None
+    if current and current.get("chat_key") == chat_key and str(current.get("user_id")) == str(context.user_id):
+        command_message = current.get("platform_message")
+    if command_message is None:
+        return None
+    image_bytes = await _image_bytes_from_message(command_message)
+    if image_bytes:
+        return image_bytes
+    ref_msg_id = _message_ref_id(command_message)
+    if ref_msg_id:
+        ref_message = await _referenced_db_message(chat_key, ref_msg_id)
+        if ref_message is not None:
+            return await _image_bytes_from_message(ref_message)
+    return None
 
 
 @plugin.mount_command(
