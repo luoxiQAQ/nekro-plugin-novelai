@@ -45,7 +45,7 @@ _plugin_kwargs: dict = dict(
     name="NovelAI 画图",
     module_name="novelai",
     description="NovelAI 文生图/图生图插件，支持 NAI v3/v4/v4.5/v5 模型。",
-    version="1.3.0",
+    version="1.4.0",
     author="luoxi",
     url="",
     i18n_name=i18n.i18n_text(zh_CN="NovelAI 画图", en_US="NovelAI Image"),
@@ -157,15 +157,20 @@ class NovelAIConfig(ConfigBase):
         description="用于将中文提示词翻译为英文 danbooru 标签的聊天模型组。留空则不翻译。",
         json_schema_extra=ExtraField(ref_model_groups=True, required=False, model_type="chat").model_dump(),
     )
-    GALLERY_UPLOAD_URL: str = Field(
+    TRANSLATE_MODEL_NAME: str = Field(
         default="",
+        title="翻译模型名",
+        description="覆盖模型组里的对话模型（如 gemini-3-flash）。留空则用模型组配置中的 CHAT_MODEL。",
+    )
+    GALLERY_UPLOAD_URL: str = Field(
+        default="https://pic.luoxi.fun/api/upload",
         title="图库上传地址",
         description="画完图自动上传到图库网站的接口地址。留空或未填密钥则不启用。",
     )
     GALLERY_UPLOAD_KEY: str = Field(
         default="",
         title="图库上传密钥",
-        description="图库网站的上传密钥。",
+        description="图库网站的上传密钥（服务器上 /opt/astrbot-gallery/state/upload_key 的内容）。",
         json_schema_extra=ExtraField(is_secret=True).model_dump(),
     )
     DRAW_BLACKLIST: str = Field(
@@ -301,7 +306,7 @@ class PresetStore:
 
 preset_store = PresetStore()
 
-# 画廊画图密钥库：与图库网站共用同一份文件，图库每 NAI5 次生成会回写 used
+# 画廊画图密钥库：与 pic.luoxi.fun 共用同一份文件，图库每 NAI5 次生成会回写 used
 GALLERY_KEYS_PATH = plugin.get_plugin_data_dir() / "gallery_draw_keys.json"
 _keys_lock = threading.RLock()
 
@@ -570,7 +575,7 @@ async def _translate_prompt(prompt: str) -> str:
         mg = global_config.MODEL_GROUPS[group_key]
         api_key = str(getattr(mg, "API_KEY", ""))
         base_url = str(getattr(mg, "BASE_URL", ""))
-        chat_model = str(getattr(mg, "CHAT_MODEL", ""))
+        chat_model = config.TRANSLATE_MODEL_NAME.strip() or str(getattr(mg, "CHAT_MODEL", ""))
         if not api_key or not base_url:
             logger.warning("NovelAI 翻译: 模型组缺少 API_KEY 或 BASE_URL，跳过翻译")
             return prompt
@@ -739,7 +744,7 @@ async def _call_vibe_transfer(prompt, ref_image_b64, width=0, height=0, model=''
         'width': width, 'height': height,
         'steps': steps, 'scale': scale, 'sampler': sampler,
         'model': model, 'seed': params.get('seed'),
-        'image_type': 'vibe_transfer',
+        'image_type': 'character_swap',
         'info_extracted': info_extracted,
         'ref_strength': ref_strength,
     }
@@ -1037,6 +1042,23 @@ async def cmd_redraw(
 
 
 
+
+def _detect_image_resolution(img_bytes: bytes) -> tuple:
+    """From image bytes, detect w/h and return closest valid NAI resolution."""
+    try:
+        from PIL import Image as PILImage
+        img = PILImage.open(io.BytesIO(img_bytes))
+        w, h = img.size
+    except Exception:
+        return 0, 0
+    ratio = w / h
+    if ratio > 1.2:
+        return 1216, 832
+    elif ratio < 0.83:
+        return 832, 1216
+    else:
+        return 1024, 1024
+
 @plugin.mount_command(
     name="来点",
     description="引用/附带图片 + 人物预设名，用图生图替换角色（保持构图和背景）",
@@ -1065,13 +1087,17 @@ async def cmd_character_swap(
         yield CmdCtl.failed("请引用或在消息中附带一张参考图片。")
         return
     yield CmdCtl.message(f"🎨 正在用「{char_name}」替换角色，请稍候...")
+    if width == 0 or height == 0:
+        auto_w, auto_h = _detect_image_resolution(ref_image)
+        if auto_w:
+            width, height = auto_w, auto_h
     try:
-        image_data, draw_info = await _call_vibe_transfer(
+        image_data, draw_info = await _call_img2img(
             prompt=char_name,
-            ref_image_b64=base64.b64encode(ref_image).decode("utf-8"),
+            image_b64=base64.b64encode(ref_image).decode("utf-8"),
             width=width, height=height,
-            info_extracted=1.0,
-            ref_strength=0.6,
+            strength=0.45,
+            noise=0.0,
         )
     except Exception as exc:
         yield CmdCtl.failed(f"角色替换失败: {exc}")
@@ -1216,7 +1242,7 @@ async def cmd_generate_gallery_key(
     context: CommandExecutionContext,
     limit: Annotated[str, Arg("NAI5 次数", positional=True)] = "",
 ) -> AsyncIterator[CommandResponse]:
-    """在图库网站生成一把随机画图密钥，默认 100 次 NAI5 额度。"""
+    """在 pic.luoxi.fun 生成一把随机画图密钥，默认 100 次 NAI5 额度。"""
     count = 100
     if limit.strip():
         try:
@@ -1248,7 +1274,7 @@ async def cmd_generate_gallery_key(
         "🎨 新画图密钥已生成\n\n"
         f"密钥：{key}\n"
         f"NAI5 可用次数：{count}\n\n"
-        "在图库网站登录页输入该密钥即可获得画图权限。\n"
+        "在 pic.luoxi.fun 登录页输入该密钥即可获得画图权限。\n"
         "（仅 NAI5 系列模型计次，其它模型不计数）"
     )
 
