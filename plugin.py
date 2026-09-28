@@ -375,7 +375,7 @@ def _expand_preset_prompt(prompt: str) -> str:
     )
 
     all_presets = preset_store.all()
-    _delimiters = set(" ,，、。！？\t\n")
+    _delimiters = set(" ,，、。！？和与跟\t\n")
     for kind, names_list in (("styles", style_names), ("characters", character_names)):
         known = sorted(all_presets[kind].keys(), key=len, reverse=True)
         for name in known:
@@ -402,6 +402,33 @@ def _expand_preset_prompt(prompt: str) -> str:
                 expanded.append(value)
     if missing:
         raise ValueError("未找到" + "、".join(missing))
+
+    if len(character_names) > 1:
+        _quality = {"masterpiece", "best quality", "very aesthetic"}
+        cleaned = []
+        girls = 0
+        boys = 0
+        for exp in expanded:
+            tags = [t.strip() for t in exp.split(",")]
+            filtered = []
+            for t in tags:
+                if t in _quality or t == "solo":
+                    continue
+                m_count = re.match(r"(\d+)(girl|boy)s?", t)
+                if m_count:
+                    if m_count.group(2) == "girl":
+                        girls += int(m_count.group(1))
+                    else:
+                        boys += int(m_count.group(1))
+                    continue
+                filtered.append(t)
+            cleaned.append(", ".join(filtered))
+        count_tags = ["masterpiece", "best quality", "very aesthetic"]
+        if girls:
+            count_tags.append(f"{girls}girls" if girls > 1 else "1girl")
+        if boys:
+            count_tags.append(f"{boys}boys" if boys > 1 else "1boy")
+        expanded = [", ".join(count_tags)] + cleaned
 
     prompt = re.sub(r"\s+", " ", prompt).strip(" ,，")
     return ", ".join(expanded + ([prompt] if prompt else []))
