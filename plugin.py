@@ -1096,8 +1096,9 @@ async def cmd_character_swap(
             prompt=char_name,
             image_b64=base64.b64encode(ref_image).decode("utf-8"),
             width=width, height=height,
-            strength=0.45,
+            strength=0.6,
             noise=0.0,
+            scale=10,
         )
     except Exception as exc:
         yield CmdCtl.failed(f"角色替换失败: {exc}")
