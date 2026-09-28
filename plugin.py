@@ -983,6 +983,58 @@ async def cmd_redraw(
         yield CmdCtl.failed("图片保存失败")
 
 
+
+
+@plugin.mount_command(
+    name="来点",
+    description="引用/附带图片 + 人物预设名，用图生图替换角色（保持构图和背景）",
+    aliases=["换人物"],
+    permission=CommandPermission.PUBLIC,
+    usage="来点 <人物预设名> [竖/方/横]",
+)
+async def cmd_character_swap(
+    context: CommandExecutionContext,
+    raw: Annotated[str, Arg("人物预设名", positional=True, greedy=True)] = "",
+) -> AsyncIterator[CommandResponse]:
+    blocked = _blacklist_reason(context)
+    if blocked:
+        yield CmdCtl.failed(f"画图功能已对{blocked}禁用。")
+        return
+    if not raw.strip():
+        yield CmdCtl.failed("用法：引用或附带一张图片，然后 /来点 人物预设名\n例如：/来点 椿 竖")
+        return
+    clean_prompt, width, height = _extract_draw_params(raw)
+    char_name = clean_prompt.strip()
+    if not char_name:
+        yield CmdCtl.failed("请提供人物预设名。")
+        return
+    ref_image = await _resolve_draw_reference_image(context)
+    if ref_image is None:
+        yield CmdCtl.failed("请引用或在消息中附带一张参考图片。")
+        return
+    yield CmdCtl.message(f"🎨 正在用「{char_name}」替换角色，请稍候...")
+    try:
+        image_data, draw_info = await _call_img2img(
+            prompt=char_name,
+            image_b64=base64.b64encode(ref_image).decode("utf-8"),
+            width=width, height=height,
+            strength=0.65,
+            noise=0.1,
+        )
+    except Exception as exc:
+        yield CmdCtl.failed(f"角色替换失败: {exc}")
+        return
+    _schedule_gallery_upload(image_data, draw_info)
+    try:
+        abs_path = _save_generated(image_data, _chat_key_of(context), raw, width, height)
+        yield CmdCtl.success([
+            CommandOutputSegment(type=CommandOutputSegmentType.TEXT, text=f"来点「{char_name}」完成"),
+            CommandOutputSegment(type=CommandOutputSegmentType.IMAGE, file_path=abs_path),
+        ])
+    except Exception:
+        yield CmdCtl.failed("图片保存失败")
+
+
 def _preset_list_text(kind: str) -> str:
     values = preset_store.all()[kind]
     if not values:
