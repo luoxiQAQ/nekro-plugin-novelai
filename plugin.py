@@ -1005,10 +1005,12 @@ def _preset_command_help(kind: str) -> str:
 )
 async def cmd_add_character(
     context: CommandExecutionContext,
-    name: Annotated[str, Arg("人物名称", positional=True)] = "",
-    prompt: Annotated[str, Arg("人物提示词", positional=True, greedy=True)] = "",
+    raw: Annotated[str, Arg("名称 提示词", positional=True, greedy=True)] = "",
 ) -> AsyncIterator[CommandResponse]:
-    if not name.strip() or not prompt.strip():
+    parts = raw.strip().split(None, 1)
+    name = parts[0] if parts else ""
+    prompt = parts[1] if len(parts) > 1 else ""
+    if not name or not prompt:
         yield CmdCtl.failed(_preset_command_help("characters"))
         return
     try:
@@ -1055,10 +1057,12 @@ async def cmd_list_characters(context: CommandExecutionContext) -> AsyncIterator
 )
 async def cmd_add_style(
     context: CommandExecutionContext,
-    name: Annotated[str, Arg("风格名称", positional=True)] = "",
-    prompt: Annotated[str, Arg("风格提示词", positional=True, greedy=True)] = "",
+    raw: Annotated[str, Arg("名称 提示词", positional=True, greedy=True)] = "",
 ) -> AsyncIterator[CommandResponse]:
-    if not name.strip() or not prompt.strip():
+    parts = raw.strip().split(None, 1)
+    name = parts[0] if parts else ""
+    prompt = parts[1] if len(parts) > 1 else ""
+    if not name or not prompt:
         yield CmdCtl.failed(_preset_command_help("styles"))
         return
     try:
