@@ -716,6 +716,58 @@ async def _call_img2img(prompt, image_b64, width=0, height=0, steps=0, scale=0, 
             raise Exception(f"NovelAI API 错误: {response.status_code} {response.text[:200]}")
 
 
+
+
+async def _call_vibe_transfer(prompt, ref_image_b64, width=0, height=0, model='',
+                              negative_prompt='', info_extracted=1.0, ref_strength=0.6):
+    model = model or config.DEFAULT_MODEL
+    dw, dh = _parse_resolution()
+    width, height = width or dw, height or dh
+    steps = config.DEFAULT_STEPS
+    scale = config.DEFAULT_SCALE
+    sampler = config.DEFAULT_SAMPLER
+    raw_prompt = prompt
+    prompt = await _translate_prompt(_expand_preset_prompt(prompt))
+    params = _build_parameters(prompt, width, height, steps, scale, sampler, model, negative_prompt)
+    params['reference_image_multiple'] = [ref_image_b64]
+    params['reference_information_extracted_multiple'] = [info_extracted]
+    params['reference_strength_multiple'] = [ref_strength]
+    info = {
+        'raw_prompt': raw_prompt,
+        'prompt': prompt,
+        'negative_prompt': _get_negative_prompt(negative_prompt),
+        'width': width, 'height': height,
+        'steps': steps, 'scale': scale, 'sampler': sampler,
+        'model': model, 'seed': params.get('seed'),
+        'image_type': 'vibe_transfer',
+        'info_extracted': info_extracted,
+        'ref_strength': ref_strength,
+    }
+    payload = {'input': prompt, 'model': model, 'action': 'generate', 'parameters': params}
+    api_url = _get_api_url('generate-image')
+    async with httpx.AsyncClient(**_build_client_config()) as client:
+        headers = _build_headers()
+        response = await client.post(api_url, headers=headers, json=payload)
+        if response.status_code == 200:
+            img = _extract_image(response.content)
+            if img is None:
+                raise Exception('unable to extract image from response')
+            logger.info(f'NovelAI vibe transfer ok: model={model}, {width}x{height}')
+            return img, info
+        elif response.status_code in (401, 402, 429):
+            reason = f'HTTP {response.status_code}: {response.text[:60]}'
+            if _rotate_token(reason):
+                headers = _build_headers()
+                response = await client.post(api_url, headers=headers, json=payload)
+                if response.status_code == 200:
+                    img = _extract_image(response.content)
+                    if img is None:
+                        raise Exception('unable to extract image')
+                    return img, info
+            raise Exception(f'NovelAI API auth/quota error: {reason}')
+        else:
+            raise Exception(f'NovelAI API error: {response.status_code} {response.text[:200]}')
+
 async def _forward_result(ctx: AgentCtx, image_data: bytes, fmt: str = "png") -> str:
     shared_root = Path(ctx.fs.shared_path).resolve()
     shared_root.mkdir(parents=True, exist_ok=True)
@@ -1014,12 +1066,12 @@ async def cmd_character_swap(
         return
     yield CmdCtl.message(f"🎨 正在用「{char_name}」替换角色，请稍候...")
     try:
-        image_data, draw_info = await _call_img2img(
+        image_data, draw_info = await _call_vibe_transfer(
             prompt=char_name,
-            image_b64=base64.b64encode(ref_image).decode("utf-8"),
+            ref_image_b64=base64.b64encode(ref_image).decode("utf-8"),
             width=width, height=height,
-            strength=0.65,
-            noise=0.1,
+            info_extracted=1.0,
+            ref_strength=0.6,
         )
     except Exception as exc:
         yield CmdCtl.failed(f"角色替换失败: {exc}")
