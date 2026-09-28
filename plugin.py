@@ -375,7 +375,7 @@ def _expand_preset_prompt(prompt: str) -> str:
     )
 
     all_presets = preset_store.all()
-    _delimiters = set(" ,，、。！？和与跟\t\n")
+    _delimiters = set(" ,，、。！？\t\n")
     for kind, names_list in (("styles", style_names), ("characters", character_names)):
         known = sorted(all_presets[kind].keys(), key=len, reverse=True)
         for name in known:
@@ -403,32 +403,6 @@ def _expand_preset_prompt(prompt: str) -> str:
     if missing:
         raise ValueError("未找到" + "、".join(missing))
 
-    if len(character_names) > 1:
-        _quality = {"masterpiece", "best quality", "very aesthetic"}
-        cleaned = []
-        girls = 0
-        boys = 0
-        for exp in expanded:
-            tags = [t.strip() for t in exp.split(",")]
-            filtered = []
-            for t in tags:
-                if t in _quality or t == "solo":
-                    continue
-                m_count = re.match(r"(\d+)(girl|boy)s?", t)
-                if m_count:
-                    if m_count.group(2) == "girl":
-                        girls += int(m_count.group(1))
-                    else:
-                        boys += int(m_count.group(1))
-                    continue
-                filtered.append(t)
-            cleaned.append(", ".join(filtered))
-        count_tags = ["masterpiece", "best quality", "very aesthetic"]
-        if girls:
-            count_tags.append(f"{girls}girls" if girls > 1 else "1girl")
-        if boys:
-            count_tags.append(f"{boys}boys" if boys > 1 else "1boy")
-        expanded = [", ".join(count_tags)] + cleaned
 
     prompt = re.sub(r"\s+", " ", prompt).strip(" ,，")
     return ", ".join(expanded + ([prompt] if prompt else []))
@@ -567,16 +541,43 @@ def _extract_image(response_data: bytes) -> Optional[bytes]:
     return None
 
 
+def _find_preset_hints(text):
+    """Scan text for known character/style preset names, return [(name, tags)]."""
+    all_presets = preset_store.all()
+    hints = []
+    for kind in ("characters", "styles"):
+        known = sorted(all_presets[kind].keys(), key=len, reverse=True)
+        for name in known:
+            if name in text:
+                hints.append((name, all_presets[kind][name]))
+    return hints
+
+
+def _build_translate_system_prompt(preset_hints=None):
+    prompt = TRANSLATE_SYSTEM_PROMPT
+    if preset_hints:
+        hint_lines = "\n".join(f"  {name} -> {tags}" for name, tags in preset_hints)
+        prompt += (
+            "\n\nIMPORTANT - Character/style presets detected in user input. "
+            "You MUST use the EXACT danbooru tags listed below for these names "
+            "(extract only the character-specific tags like character_name_(series), "
+            "do NOT duplicate quality tags, do NOT use solo when multiple characters, "
+            "add correct count tags like 2girls):\n"
+            + hint_lines
+        )
+    return prompt
+
+
 def _has_chinese(text: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", text))
 
 
-async def _llm_translate_segment(client, chat_model: str, text: str) -> str:
+async def _llm_translate_segment(client, chat_model: str, text: str, preset_hints=None) -> str:
     try:
         response = await client.chat.completions.create(
             model=chat_model,
             messages=[
-                {"role": "system", "content": TRANSLATE_SYSTEM_PROMPT},
+                {"role": "system", "content": _build_translate_system_prompt(preset_hints)},
                 {"role": "user", "content": f"请将以下描述翻译为 NovelAI 画图提示词（danbooru 标签格式），不要添加 quality 标签：\n\n{text}"},
             ],
             max_tokens=300, temperature=0.3,
@@ -618,8 +619,9 @@ async def _translate_prompt(prompt: str) -> str:
                 result_parts.append(part)
         if not to_translate:
             return prompt
+        preset_hints = _find_preset_hints(prompt)
         translated = await asyncio.gather(
-            *[_llm_translate_segment(client, chat_model, text) for _, text in to_translate]
+            *[_llm_translate_segment(client, chat_model, text, preset_hints=preset_hints) for _, text in to_translate]
         )
         for (idx, _orig), trans in zip(to_translate, translated):
             result_parts[idx] = trans
