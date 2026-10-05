@@ -45,7 +45,7 @@ _plugin_kwargs: dict = dict(
     name="NovelAI 画图",
     module_name="novelai",
     description="NovelAI 文生图/图生图插件，支持 NAI v3/v4/v4.5/v5 模型。",
-    version="1.5.0",
+    version="1.5.1",
     author="luoxi",
     url="",
     i18n_name=i18n.i18n_text(zh_CN="NovelAI 画图", en_US="NovelAI Image"),
@@ -1112,6 +1112,8 @@ async def cmd_laidian(
     if ref_image is None:
         chat_key = _chat_key_of(context)
         ref_image = await _latest_db_image_bytes(chat_key)
+        if ref_image is None:
+            ref_image = await _image_bytes_from_cache(chat_key)
     if ref_image is None:
         yield CmdCtl.failed("请回复/引用一张图片后再使用「来点」命令。")
         return
@@ -1582,6 +1584,97 @@ async def _load_image_bytes(local_path: str, remote_url: str) -> Optional[bytes]
     return None
 
 
+# ---------------------------------------------------------------------------
+# 最近图片内存缓存（/反推、/来点 在 AI 未启用的会话里取图用）
+#
+# 只有 AI 启用（active）的会话消息才会写入 DBChatMessage；AI 未启用的会话里
+# 「回复一张图 + /反推」「回复一张图 + /来点」经过数据库的取图路径会全部落空。
+# 这里在 collector 层把每条消息的图片段缓存进内存，供命令在数据库查不到时兜底。
+# 进程内生效，每会话保留最近 8 条、24 小时过期。
+# ---------------------------------------------------------------------------
+
+_recent_images: Dict[str, List[Dict[str, Any]]] = {}
+_recent_images_lock = threading.Lock()
+_RECENT_IMAGES_TTL = 86400.0
+_RECENT_IMAGES_MAX = 8
+
+
+def _cache_recent_images(chat_key: str, message: Any) -> None:
+    if not chat_key:
+        return
+    content_data = getattr(message, "content_data", None)
+    if isinstance(content_data, str):
+        try:
+            content_data = message.parse_content_data()
+        except Exception:
+            return
+    images: List[Dict[str, str]] = []
+    for segment in content_data or []:
+        if _segment_type_of(segment) != "image":
+            continue
+        local_path = _segment_field(segment, "local_path")
+        remote_url = _segment_field(segment, "remote_url")
+        if local_path or remote_url:
+            images.append({"local_path": local_path, "remote_url": remote_url})
+    if not images:
+        return
+    now = _time.time()
+    with _recent_images_lock:
+        entries = [e for e in _recent_images.get(chat_key, []) if now - e["ts"] < _RECENT_IMAGES_TTL]
+        entries.append({
+            "mid": str(getattr(message, "message_id", "") or ""),
+            "ts": now,
+            "images": images,
+        })
+        _recent_images[chat_key] = entries[-_RECENT_IMAGES_MAX:]
+
+
+async def _image_bytes_from_cache(chat_key: str, ref_msg_id: str = "") -> Optional[bytes]:
+    """从内存缓存取图；ref_msg_id 非空时只匹配该条消息，否则取最近一张。"""
+    if not chat_key:
+        return None
+    now = _time.time()
+    with _recent_images_lock:
+        entries = [e for e in _recent_images.get(chat_key, []) if now - e["ts"] < _RECENT_IMAGES_TTL]
+    if ref_msg_id:
+        entries = [e for e in entries if e.get("mid") == ref_msg_id]
+    for entry in reversed(entries):
+        for image in entry.get("images", []):
+            image_bytes = await _load_image_bytes(image.get("local_path", ""), image.get("remote_url", ""))
+            if image_bytes:
+                return image_bytes
+    return None
+
+
+def _install_message_cache_patch() -> None:
+    """包装 collector._collect_message，在消息处理前缓存图片段（含 AI 未启用会话）。"""
+    try:
+        from nekro_agent.adapters.interface import collector
+    except Exception as exc:
+        logger.debug(f"跳过消息图片缓存补丁: {exc}")
+        return
+
+    original = getattr(collector, "_collect_message", None)
+    if not original:
+        return
+    if getattr(original, "__novelai_cache_wrapped__", False):
+        original = getattr(original, "__novelai_cache_original__", original)
+
+    async def _wrapped_collect_message(adapter, platform_channel, platform_user, platform_message):
+        try:
+            _cache_recent_images(adapter.build_chat_key(platform_channel.channel_id), platform_message)
+        except Exception as exc:
+            logger.debug(f"缓存消息图片失败: {exc}")
+        return await original(adapter, platform_channel, platform_user, platform_message)
+
+    setattr(_wrapped_collect_message, "__novelai_cache_wrapped__", True)
+    setattr(_wrapped_collect_message, "__novelai_cache_original__", original)
+    collector._collect_message = _wrapped_collect_message
+
+
+_install_message_cache_patch()
+
+
 def _message_ref_id(message: Any) -> str:
     """从 PlatformMessage / DBChatMessage / dict 里取被引用消息 ID。"""
     ext_obj = getattr(message, "ext_data_obj", None)
@@ -1673,8 +1766,14 @@ async def _resolve_metadata_image_bytes(context: CommandExecutionContext) -> tup
                 image_bytes = await _image_bytes_from_message(ref_message)
                 if image_bytes:
                     return image_bytes, "引用消息"
+            image_bytes = await _image_bytes_from_cache(chat_key, ref_msg_id)
+            if image_bytes:
+                return image_bytes, "引用消息"
 
-    return await _latest_db_image_bytes(chat_key), "最近聊天图片"
+    image_bytes = await _latest_db_image_bytes(chat_key)
+    if image_bytes is None:
+        image_bytes = await _image_bytes_from_cache(chat_key)
+    return image_bytes, "最近聊天图片"
 
 
 async def _resolve_draw_reference_image(context: CommandExecutionContext) -> Optional[bytes]:
@@ -1693,7 +1792,12 @@ async def _resolve_draw_reference_image(context: CommandExecutionContext) -> Opt
     if ref_msg_id:
         ref_message = await _referenced_db_message(chat_key, ref_msg_id)
         if ref_message is not None:
-            return await _image_bytes_from_message(ref_message)
+            image_bytes = await _image_bytes_from_message(ref_message)
+            if image_bytes:
+                return image_bytes
+        image_bytes = await _image_bytes_from_cache(chat_key, ref_msg_id)
+        if image_bytes:
+            return image_bytes
     return None
 
 
