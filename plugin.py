@@ -45,7 +45,7 @@ _plugin_kwargs: dict = dict(
     name="NovelAI 画图",
     module_name="novelai",
     description="NovelAI 文生图/图生图插件，支持 NAI v3/v4/v4.5/v5 模型。",
-    version="1.4.0",
+    version="1.5.0",
     author="luoxi",
     url="",
     i18n_name=i18n.i18n_text(zh_CN="NovelAI 画图", en_US="NovelAI Image"),
@@ -146,6 +146,13 @@ class NovelAIConfig(ConfigBase):
     )
     IMG2IMG_STRENGTH: float = Field(default=0.5, title="图生图强度", description="图生图强度 (0.1-0.9)。", ge=0.1, le=0.9)
     IMG2IMG_NOISE: float = Field(default=0.2, title="图生图噪声", description="图生图噪声 (0.0-1.0)。", ge=0.0, le=1.0)
+    CHAR_SWAP_STRENGTH: float = Field(default=0.65, title="来点-图生图强度", description="来点换人物时的图生图强度 (0.1-0.9)，越大越偏离原图。", ge=0.1, le=0.9)
+    CHAR_SWAP_NOISE: float = Field(default=0.2, title="来点-图生图噪声", description="来点换人物时的图生图噪声 (0.0-1.0)。", ge=0.0, le=1.0)
+    ONLY_INSTANCE_ID: str = Field(
+        default="",
+        title="仅限实例标识",
+        description="留空 = 不限制。填写后只响应来自该实例的消息（多个账号共用同一个 nekro 部署时，实例标识一般是该账号的 QQ 号），其余实例静默。",
+    )
     ENABLE_R18: bool = Field(
         default=False,
         title="R18 画图开关",
@@ -827,6 +834,27 @@ def _blacklist_reason(context) -> str:
     return ""
 
 
+# ==================== 实例限制（可选，配置 ONLY_INSTANCE_ID） ====================
+# 多账号共用同一个 nekro 部署时，chat_key 形如 "onebot_v11-<实例标识>:<kind>_<id>"。
+# 配置 ONLY_INSTANCE_ID 后本插件只响应来自该实例的消息，其余实例一律静默不响应；留空则不做限制。
+def _is_main_instance(chat_key) -> bool:
+    """判断会话是否允许触发本插件（实例限制可选，见配置 ONLY_INSTANCE_ID）。
+
+    未配置限制时一律返回 True；配置后仅该实例标识的会话可通过，
+    无实例前缀的历史数据、非 onebot 渠道一律返回 False。
+    """
+    target = str(getattr(config, "ONLY_INSTANCE_ID", "") or "").strip()
+    if not target:
+        return True
+    if not chat_key:
+        return False
+    text = str(chat_key)
+    raw = text.split("-", 1)[-1] if "-" in text else text
+    scope, sep, rest = raw.partition(":")
+    if not sep or not rest.startswith(("group_", "private_")):
+        return False
+    return scope == target
+
 def _blacklist_save(entries: dict) -> None:
     config.DRAW_BLACKLIST = "\n".join(f"{number} {note}".strip() for number, note in entries.items())
     plugin.save_config(config)
@@ -941,6 +969,8 @@ async def cmd_draw(
     prompt: Annotated[str, Arg("画图提示词", positional=True, greedy=True)] = "",
 ) -> AsyncIterator[CommandResponse]:
     """使用 NovelAI 生成图片。支持中文描述（自动翻译）、英文 danbooru 标签、预设引用（@人物/#风格/裸名）。末尾加「竖/方/横」指定尺寸。"""
+    if not _is_main_instance(_chat_key_of(context)):
+        return
     blocked = _blacklist_reason(context)
     if blocked:
         yield CmdCtl.failed(f"画图功能已对{blocked}禁用。")
@@ -987,6 +1017,8 @@ async def cmd_redraw(
     context: CommandExecutionContext,
     extra: Annotated[str, Arg("追加描述", positional=True, greedy=True)] = "",
 ) -> AsyncIterator[CommandResponse]:
+    if not _is_main_instance(_chat_key_of(context)):
+        return
     blocked = _blacklist_reason(context)
     if blocked:
         yield CmdCtl.failed(f"画图功能已对{blocked}禁用。")
@@ -1025,6 +1057,100 @@ async def cmd_redraw(
 
 
 
+
+
+@plugin.mount_command(
+    name="来点",
+    description="引用/回复一张图 + 人物预设名，换人物重画（保留姿势、衣服、风格）",
+    aliases=["来点nai", "laidian"],
+    permission=CommandPermission.PUBLIC,
+    usage="来点 <人物预设名> [竖/方/横]",
+)
+async def cmd_laidian(
+    context: CommandExecutionContext,
+    prompt: Annotated[str, Arg("人物预设名(+可选描述)", positional=True, greedy=True)] = "",
+) -> AsyncIterator[CommandResponse]:
+    if not _is_main_instance(_chat_key_of(context)):
+        return
+    blocked = _blacklist_reason(context)
+    if blocked:
+        yield CmdCtl.failed(f"画图功能已对{blocked}禁用。")
+        return
+    if not prompt.strip():
+        yield CmdCtl.failed("请提供人物预设名，例如: /来点 椿\n回复/引用一张图片后使用本命令。")
+        return
+
+    clean_prompt, width, height = _extract_draw_params(prompt)
+    char_input = clean_prompt.strip()
+
+    char_names = []
+    remaining = char_input
+    all_presets = preset_store.all()
+    known_chars = sorted(all_presets["characters"].keys(), key=len, reverse=True)
+    _delims = set(" ,，、\t\n")
+    for name in known_chars:
+        idx = remaining.find(name)
+        if idx < 0:
+            continue
+        before_ok = idx == 0 or remaining[idx - 1] in _delims
+        after_idx = idx + len(name)
+        after_ok = after_idx >= len(remaining) or remaining[after_idx] in _delims
+        if before_ok and after_ok:
+            char_names.append(name)
+            remaining = remaining[:idx] + remaining[after_idx:]
+
+    if not char_names:
+        char_value = preset_store.get("characters", char_input)
+        if char_value is None:
+            available = "、".join(list(all_presets["characters"].keys())[:20])
+            yield CmdCtl.failed(f"未找到人物预设「{char_input}」。\n可用预设（前20个）：{available}")
+            return
+        char_names = [char_input]
+        remaining = ""
+
+    ref_image = await _resolve_draw_reference_image(context)
+    if ref_image is None:
+        chat_key = _chat_key_of(context)
+        ref_image = await _latest_db_image_bytes(chat_key)
+    if ref_image is None:
+        yield CmdCtl.failed("请回复/引用一张图片后再使用「来点」命令。")
+        return
+
+    expanded_parts = []
+    for name in char_names:
+        value = preset_store.get("characters", name)
+        if value:
+            expanded_parts.append(value)
+    if remaining.strip(" ,，"):
+        expanded_parts.append(remaining.strip(" ,，"))
+    final_prompt = ", ".join(expanded_parts)
+
+    char_label = "、".join(char_names)
+    yield CmdCtl.message(f"正在用「{char_label}」换人物，请稍候...")
+    image_b64 = base64.b64encode(ref_image).decode("utf-8")
+    try:
+        image_data, draw_info = await _call_img2img(
+            prompt=final_prompt,
+            image_b64=image_b64,
+            width=width, height=height,
+            strength=config.CHAR_SWAP_STRENGTH,
+            noise=config.CHAR_SWAP_NOISE,
+        )
+    except Exception as exc:
+        yield CmdCtl.failed(f"NovelAI 换人物失败: {exc}")
+        return
+    _schedule_gallery_upload(image_data, draw_info)
+    try:
+        chat_key = _chat_key_of(context)
+        abs_path = _save_generated(image_data, chat_key, final_prompt, width, height)
+        yield CmdCtl.success([
+            CommandOutputSegment(type=CommandOutputSegmentType.TEXT, text=f"来点「{char_label}」完成"),
+            CommandOutputSegment(type=CommandOutputSegmentType.IMAGE, file_path=abs_path),
+        ])
+    except Exception:
+        yield CmdCtl.failed("图片保存失败")
+
+
 def _preset_list_text(kind: str) -> str:
     values = preset_store.all()[kind]
     if not values:
@@ -1053,6 +1179,8 @@ async def cmd_add_character(
     name = parts[0] if parts else ""
     prompt = parts[1] if len(parts) > 1 else ""
     if not name or not prompt:
+        if not _is_main_instance(_chat_key_of(context)):
+            return
         yield CmdCtl.failed(_preset_command_help("characters"))
         return
     try:
@@ -1073,6 +1201,8 @@ async def cmd_delete_character(
     name: Annotated[str, Arg("人物名称", positional=True)] = "",
 ) -> AsyncIterator[CommandResponse]:
     if not name.strip():
+        if not _is_main_instance(_chat_key_of(context)):
+            return
         yield CmdCtl.failed("用法：/删除人物 名称")
         return
     if preset_store.delete("characters", name):
@@ -1088,6 +1218,8 @@ async def cmd_delete_character(
     usage="人物列表",
 )
 async def cmd_list_characters(context: CommandExecutionContext) -> AsyncIterator[CommandResponse]:
+    if not _is_main_instance(_chat_key_of(context)):
+        return
     yield CmdCtl.message(_preset_list_text("characters"))
 
 
@@ -1105,6 +1237,8 @@ async def cmd_add_style(
     name = parts[0] if parts else ""
     prompt = parts[1] if len(parts) > 1 else ""
     if not name or not prompt:
+        if not _is_main_instance(_chat_key_of(context)):
+            return
         yield CmdCtl.failed(_preset_command_help("styles"))
         return
     try:
@@ -1125,6 +1259,8 @@ async def cmd_delete_style(
     name: Annotated[str, Arg("风格名称", positional=True)] = "",
 ) -> AsyncIterator[CommandResponse]:
     if not name.strip():
+        if not _is_main_instance(_chat_key_of(context)):
+            return
         yield CmdCtl.failed("用法：/删除风格 名称")
         return
     if preset_store.delete("styles", name):
@@ -1140,6 +1276,8 @@ async def cmd_delete_style(
     usage="风格列表",
 )
 async def cmd_list_styles(context: CommandExecutionContext) -> AsyncIterator[CommandResponse]:
+    if not _is_main_instance(_chat_key_of(context)):
+        return
     yield CmdCtl.message(_preset_list_text("styles"))
 
 
@@ -1160,6 +1298,8 @@ async def cmd_generate_gallery_key(
         try:
             count = max(1, int(limit.strip()))
         except ValueError:
+            if not _is_main_instance(_chat_key_of(context)):
+                return
             yield CmdCtl.failed("次数必须是数字，例：/生成画图密钥 100")
             return
     with _keys_lock:
@@ -1203,6 +1343,8 @@ async def cmd_add_gallery_key_quota(
     count: Annotated[str, Arg("次数", positional=True)] = "",
 ) -> AsyncIterator[CommandResponse]:
     if not key.strip() or not count.strip():
+        if not _is_main_instance(_chat_key_of(context)):
+            return
         yield CmdCtl.failed("用法：/增加画图次数 <密钥> <次数>")
         return
     try:
@@ -1235,6 +1377,8 @@ async def cmd_add_gallery_key_quota(
 async def cmd_list_gallery_keys(context: CommandExecutionContext) -> AsyncIterator[CommandResponse]:
     keys = _load_draw_keys()
     if not keys:
+        if not _is_main_instance(_chat_key_of(context)):
+            return
         yield CmdCtl.message("暂无画图密钥，用 /生成画图密钥 创建")
         return
     lines = [f"🗝 画图密钥列表（共 {len(keys)} 个）"]
@@ -1257,6 +1401,8 @@ async def cmd_delete_gallery_key(
     key: Annotated[str, Arg("密钥", positional=True)] = "",
 ) -> AsyncIterator[CommandResponse]:
     if not key.strip():
+        if not _is_main_instance(_chat_key_of(context)):
+            return
         yield CmdCtl.failed("用法：/删除画图密钥 <密钥>")
         return
     with _keys_lock:
@@ -1289,6 +1435,8 @@ async def cmd_blacklist_add(
     if not target:
         target = _blacklist_number_of(context)
     if not target.isdigit():
+        if not _is_main_instance(_chat_key_of(context)):
+            return
         yield CmdCtl.failed("请提供 QQ 号或群号，例如：/拉黑 123456789 水群；不带号码则拉黑当前群（私聊则为当前用户）。")
         return
     entries = _blacklist_entries()
@@ -1319,6 +1467,8 @@ async def cmd_blacklist_remove(
     if not target:
         target = _blacklist_number_of(context)
     if not target.isdigit():
+        if not _is_main_instance(_chat_key_of(context)):
+            return
         yield CmdCtl.failed("请提供要移出黑名单的 QQ 号或群号，例如：/解除拉黑 123456789")
         return
     entries = _blacklist_entries()
@@ -1344,6 +1494,8 @@ async def cmd_blacklist_remove(
 async def cmd_blacklist_list(context: CommandExecutionContext) -> AsyncIterator[CommandResponse]:
     entries = _blacklist_entries()
     if not entries:
+        if not _is_main_instance(_chat_key_of(context)):
+            return
         yield CmdCtl.message("画图黑名单为空。用 /拉黑 <QQ号或群号> [备注] 添加。")
         return
     lines = [f"画图黑名单（{len(entries)} 条）："]
@@ -1558,6 +1710,8 @@ async def cmd_metadata(
 ) -> AsyncIterator[CommandResponse]:
     img_bytes, source = await _resolve_metadata_image_bytes(context)
     if img_bytes is not None:
+        if not _is_main_instance(_chat_key_of(context)):
+            return
         yield CmdCtl.message(f"正在提取图片参数...（来源: {source}）")
     if img_bytes is None:
         chat_key = _chat_key_of(context)
@@ -2002,6 +2156,8 @@ async def novelai_generate(
     Returns:
         生成图片的沙盒路径。
     """
+    if not _is_main_instance(getattr(_ctx, "chat_key", None)):
+        return "该功能仅限指定实例使用。"
     blocked = _blacklist_reason(_ctx)
     if blocked:
         return f"画图功能已对{blocked}禁用（黑名单），无法生成图片。不要再尝试调用画图工具，直接告知用户被管理员禁用了。"
@@ -2049,6 +2205,8 @@ async def novelai_img2img(
     Returns:
         生成图片的沙盒路径。
     """
+    if not _is_main_instance(getattr(_ctx, "chat_key", None)):
+        return "该功能仅限指定实例使用。"
     blocked = _blacklist_reason(_ctx)
     if blocked:
         return f"画图功能已对{blocked}禁用（黑名单），无法生成图片。不要再尝试调用画图工具，直接告知用户被管理员禁用了。"
