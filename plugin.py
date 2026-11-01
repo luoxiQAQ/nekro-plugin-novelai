@@ -45,7 +45,7 @@ _plugin_kwargs: dict = dict(
     name="NovelAI 画图",
     module_name="novelai",
     description="NovelAI 文生图/图生图插件，支持 NAI v3/v4/v4.5/v5 模型。",
-    version="1.5.1",
+    version="1.6.0",
     author="luoxi",
     url="",
     i18n_name=i18n.i18n_text(zh_CN="NovelAI 画图", en_US="NovelAI Image"),
@@ -84,7 +84,7 @@ V4_STYLE_MODELS = {
 
 
 def _is_v4_style(model: str) -> bool:
-    return model.lower() in V4_STYLE_MODELS
+    return model.split("@")[0].strip().lower() in V4_STYLE_MODELS
 
 
 def _model_label(model: str) -> str:
@@ -128,6 +128,16 @@ class NovelAIConfig(ConfigBase):
         default="nai-diffusion-4-5-full",
         title="模型",
         description="默认使用的 NovelAI 模型。",
+    )
+    MODEL_NAME_OVERRIDE: str = Field(
+        default="",
+        title="模型名覆盖",
+        description="留空则使用上方选择的模型；填写后优先使用此值。可填中转站带后缀的模型名，例如 nai-diffusion-5-full@浅夜。",
+    )
+    API_MODE: Literal["novelai", "openai"] = Field(
+        default="novelai",
+        title="接口模式",
+        description="novelai：原生 NAI 接口（/ai/generate-image）。openai：OpenAI 兼容图像接口（/v1/images/generations），用于只提供 OpenAI 格式的中转站，该模式不支持图生图。",
     )
     DEFAULT_RESOLUTION: RESOLUTION_CHOICES = Field(
         default="832x1216",
@@ -458,6 +468,75 @@ def _get_api_url(endpoint: str = "generate-image") -> str:
     return f"{NAI_API_BASE}/ai/{endpoint}"
 
 
+def _resolve_model(model: str = "") -> str:
+    return (config.MODEL_NAME_OVERRIDE or "").strip() or model or config.DEFAULT_MODEL
+
+
+def _get_openai_images_url() -> str:
+    base = (config.API_PROXY or "").strip().rstrip("/")
+    if not base:
+        raise ValueError("OpenAI 兼容模式需要填写 API 反代地址，例如 https://newapi.akiyo.fun")
+    return f"{base}/images/generations" if base.endswith("/v1") else f"{base}/v1/images/generations"
+
+
+async def _call_openai_image(
+    prompt: str, width: int, height: int, model: str, negative_prompt: str,
+    steps: int, scale: float, sampler: str, seed: int,
+) -> bytes:
+    url = _get_openai_images_url()
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "n": 1,
+        "size": f"{width}x{height}",
+        "response_format": "b64_json",
+        "negative_prompt": negative_prompt,
+        "steps": steps,
+        "scale": scale,
+        "sampler": sampler,
+        "seed": seed,
+    }
+    max_retries = 3 if len(_get_tokens()) > 1 else 2
+    last_error = ""
+    async with httpx.AsyncClient(**_build_client_config()) as client:
+        for retry in range(max_retries):
+            try:
+                if retry > 0:
+                    await asyncio.sleep(retry * 1.0)
+                response = await client.post(url, headers=_build_headers(), json=payload)
+                if response.status_code == 200:
+                    try:
+                        data = response.json()
+                    except Exception:
+                        raise Exception(f"OpenAI 图像接口返回非 JSON: {response.text[:200]}")
+                    items = data.get("data") or []
+                    if not items:
+                        raise Exception(f"OpenAI 图像接口响应异常: {str(data)[:200]}")
+                    item = items[0]
+                    if item.get("b64_json"):
+                        return base64.b64decode(item["b64_json"])
+                    if item.get("url"):
+                        img_resp = await client.get(item["url"])
+                        if img_resp.status_code == 200:
+                            return img_resp.content
+                        raise Exception(f"下载图片失败: HTTP {img_resp.status_code}")
+                    raise Exception(f"OpenAI 图像接口未返回图片: {str(item)[:200]}")
+                last_error = f"HTTP {response.status_code}: {response.text[:200]}"
+                if response.status_code in (401, 402, 429) and retry < max_retries - 1 and _rotate_token(last_error):
+                    continue
+                if response.status_code >= 500 and retry < max_retries - 1:
+                    logger.warning(f"OpenAI 图像接口服务端错误 {response.status_code}，将重试")
+                    continue
+                raise Exception(f"OpenAI 图像接口错误: {last_error}")
+            except httpx.RequestError as exc:
+                last_error = str(exc)
+                if retry < max_retries - 1:
+                    logger.warning(f"网络请求失败: {exc}，将重试")
+                    continue
+                raise Exception(f"NovelAI 网络错误: {exc}") from exc
+    raise Exception(f"OpenAI 图像接口请求失败: {last_error}")
+
+
 def _parse_resolution() -> tuple:
     res = config.DEFAULT_RESOLUTION or "832x1216"
     m = re.match(r"(\d+)[xX×](\d+)", res)
@@ -644,7 +723,7 @@ async def _translate_prompt(prompt: str) -> str:
 
 
 async def _call_txt2img(prompt, width=0, height=0, steps=0, scale=0, sampler="", model="", negative_prompt=""):
-    model = model or config.DEFAULT_MODEL
+    model = _resolve_model(model)
     dw, dh = _parse_resolution()
     width, height = width or dw, height or dh
     steps = steps or config.DEFAULT_STEPS
@@ -652,6 +731,27 @@ async def _call_txt2img(prompt, width=0, height=0, steps=0, scale=0, sampler="",
     sampler = sampler or config.DEFAULT_SAMPLER
     raw_prompt = prompt
     prompt = await _translate_prompt(_expand_preset_prompt(prompt))
+    if config.API_MODE == "openai":
+        seed = random.randint(0, 4294967295)
+        info = {
+            "raw_prompt": raw_prompt,
+            "prompt": prompt,
+            "negative_prompt": _get_negative_prompt(negative_prompt),
+            "width": width,
+            "height": height,
+            "steps": steps,
+            "scale": scale,
+            "sampler": sampler,
+            "model": model,
+            "seed": seed,
+            "image_type": "txt2img",
+            "api_mode": "openai",
+        }
+        img = await _call_openai_image(
+            prompt, width, height, model, info["negative_prompt"], steps, scale, sampler, seed
+        )
+        logger.info(f"NovelAI 文生图成功(OpenAI 兼容): model={model}, {width}x{height}")
+        return img, info
     params = _build_parameters(prompt, width, height, steps, scale, sampler, model, negative_prompt)
     info = {
         "raw_prompt": raw_prompt,
@@ -703,7 +803,9 @@ async def _call_txt2img(prompt, width=0, height=0, steps=0, scale=0, sampler="",
 
 
 async def _call_img2img(prompt, image_b64, width=0, height=0, steps=0, scale=0, strength=0, noise=-1, model="", negative_prompt=""):
-    model = model or config.DEFAULT_MODEL
+    model = _resolve_model(model)
+    if config.API_MODE == "openai":
+        raise Exception("当前为 OpenAI 兼容接口模式，该模式不支持图生图（/重画、/来点）。要用图生图请把「接口模式」切回 novelai。")
     dw, dh = _parse_resolution()
     width, height = width or dw, height or dh
     steps = steps or config.DEFAULT_STEPS
