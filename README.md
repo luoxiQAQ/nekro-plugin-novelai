@@ -26,7 +26,7 @@
 - 检查前后是否为分隔符（逗号、空格、句首/句尾），防止子串误触发
 - 例如：预设「椿」不会匹配「椿花绽放」，但会匹配「椿，花田」
 
-仓库根目录附带 **`presets.json`**，内含 **1062 个**人物预设（以二次元游戏角色为主：明日方舟、原神、崩坏：星穹铁道、鸣潮、蔚蓝档案、绝区零、崩坏3 等；画风预设为空），复制到插件数据目录 `plugin_data/luoxi.novelai/presets.json` 即可使用，也可以在此基础上增删；格式见下文「导入预设」。
+仓库根目录附带 **`presets.json`**，内含 **1062 个人物预设 + 60 条画风预设**（人物以二次元游戏角色为主：明日方舟、原神、崩坏：星穹铁道、鸣潮、蔚蓝档案、绝区零、崩坏3 等），复制到插件数据目录 `plugin_data/luoxi.novelai/presets.json` 即可使用，也可以在此基础上增删；格式见下文「导入预设」。
 
 ### 🌐 智能分段翻译
 
@@ -187,7 +187,7 @@ git clone https://github.com/luoxiQAQ/nekro-plugin-novelai.git nekro_plugin_nove
 
 ### 导入预设
 
-仓库根目录的 `presets.json` 就是给直接使用的：含 1062 个人物预设，画风预设为空。市场安装的插件目录是 `plugins/packages/novelai`（手动 clone 则是 `nekro_plugin_novelai`），复制到插件数据目录：
+仓库根目录的 `presets.json` 就是给直接使用的：含 1062 个人物预设 + 60 条画风预设。市场安装的插件目录是 `plugins/packages/novelai`（手动 clone 则是 `nekro_plugin_novelai`），复制到插件数据目录：
 
 ```bash
 cp /path/to/nekro_agent/plugins/packages/novelai/presets.json \
