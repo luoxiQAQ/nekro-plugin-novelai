@@ -103,9 +103,7 @@
 
 ### 🔑 多 Token 轮切
 
-插件配置页的**第一项就是 `NovelAI API Token（必填）`**——不填这个后续所有画图都会失败。填 NovelAI 官方或中转站的密钥（形如 `sk-...` / `pst-...`）。
-
-多个 Token 用英文逗号分隔，遇到 401/402/429 错误时自动轮切到下一个 Token 重试，提高可用性。
+在插件配置中填入多个 NovelAI API Token（逗号分隔），遇到 401/402/429 错误时自动轮切到下一个 Token 重试，提高可用性。
 
 ### 🤖 Sandbox Tool
 
@@ -157,7 +155,7 @@ LLM 可以在对话中根据用户意图自动调用这些工具画图，无需�
 
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
-| **API Token（必填）** | **配置页第一项。**填 NovelAI 官方 / 中转站密钥（`sk-...` / `pst-...`），多个用英文逗号分隔，遇 401/402/429 自动轮切 | — |
+| API Token | NovelAI API Token，支持多个用逗号分隔 | — |
 | API 反代地址 | 替换官方 API 地址，留空使用官方 | — |
 | HTTP 代理 | HTTP/SOCKS5 代理地址 | — |
 | 模型 | 默认使用的 NAI 模型 | `nai-diffusion-4-5-full` |
@@ -185,7 +183,7 @@ cd /path/to/nekro_agent/plugins/packages/
 git clone https://github.com/luoxiQAQ/nekro-plugin-novelai.git nekro_plugin_novelai
 ```
 
-重启 Nekro Agent，打开管理面板 → 插件配置，**第一项「NovelAI API Token（必填）」填上密钥**即可使用。
+重启 Nekro Agent，在管理面板中配置 API Token 即可使用。
 
 ### 导入预设
 

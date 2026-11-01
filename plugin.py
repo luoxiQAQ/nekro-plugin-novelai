@@ -45,7 +45,7 @@ _plugin_kwargs: dict = dict(
     name="NovelAI 画图",
     module_name="novelai",
     description="NovelAI 文生图/图生图插件，支持 NAI v3/v4/v4.5/v5 模型。",
-    version="1.6.1",
+    version="1.6.0",
     author="luoxi",
     url="",
     i18n_name=i18n.i18n_text(zh_CN="NovelAI 画图", en_US="NovelAI Image"),
@@ -110,13 +110,9 @@ def _create_v4_prompt(prompt: str) -> dict:
 class NovelAIConfig(ConfigBase):
     API_TOKEN: str = Field(
         default="",
-        title="NovelAI API Token（必填）",
-        description="填 NovelAI 官方或中转站的 API Token/密钥，多个用英文逗号分隔，遇 401/402/429 自动轮切。配置页第一项就是这里，不填无法画图。",
-        json_schema_extra=ExtraField(
-            is_secret=True,
-            required=True,
-            placeholder="sk-... 或 pst-...",
-        ).model_dump(),
+        title="NovelAI API Token",
+        description="NovelAI API Token，支持多个用逗号分隔，自动轮切。",
+        json_schema_extra=ExtraField(is_secret=True).model_dump(),
     )
     API_PROXY: str = Field(
         default="",
