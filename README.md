@@ -26,7 +26,7 @@
 - 检查前后是否为分隔符（逗号、空格、句首/句尾），防止子串误触发
 - 例如：预设「椿」不会匹配「椿花绽放」，但会匹配「椿，花田」
 
-仓库附带 `presets.json`，包含 **1062 个角色预设**（明日方舟 431 / 原神 114 / 蔚蓝档案 104 / 崩坏星穹铁道 85 / 鸣潮 58 / 崩坏3 37 / 绝区零 11 等 20 余个作品）。画风预设需要自行添加。
+预设文件**不随仓库提供**，需要在插件数据目录自行创建 `plugin_data/luoxi.novelai/presets.json`（格式见下文「导入预设」），人物预设和画风预设都放在这个文件里。
 
 ### 🌐 智能分段翻译
 
@@ -187,13 +187,14 @@ git clone https://github.com/luoxiQAQ/nekro-plugin-novelai.git nekro_plugin_nove
 
 ### 导入预设
 
-仓库附带的 `presets.json` 包含 1062 个角色预设（不含画风预设，请自行添加）。将其复制到插件数据目录：
+预设文件不随仓库提供，需要自己准备。把它放到插件数据目录：
 
 ```bash
-cp presets.json /path/to/nekro_agent/plugin_data/luoxi.novelai/presets.json
+# 文件不存在时新建即可
+/path/to/nekro_agent/plugin_data/luoxi.novelai/presets.json
 ```
 
-也可以只挑选需要的条目：用文本编辑器打开 `presets.json`，删除不需要的键值对后保存，再复制过去即可。文件结构非常简单：
+文件结构非常简单，`characters` 是人物预设、`styles` 是画风预设，值填英文标签串即可：
 
 ```json
 {
