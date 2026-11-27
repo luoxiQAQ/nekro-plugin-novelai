@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Annotated, Any, AsyncIterator, Dict, List, Literal, Optional
 
 import httpx
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from nekro_agent.api import i18n
 from nekro_agent.api.plugin import (
@@ -41,7 +41,7 @@ _plugin_kwargs: dict = dict(
     name="NovelAI 画图",
     module_name="novelai",
     description="NovelAI 文生图/图生图/精准参考插件，支持 NAI v3/v4/v4.5/v5 模型。",
-    version="1.8.5",
+    version="1.8.6",
     author="luoxi",
     url="",
     i18n_name=i18n.i18n_text(zh_CN="NovelAI 画图", en_US="NovelAI Image"),
@@ -71,6 +71,26 @@ RESOLUTION_CHOICES = Literal[
     "1216x832",
     "1024x1024",
 ]
+
+PRECISE_MODE_CHOICES = Literal["仅角色", "仅风格", "角色与风格"]
+
+# 参考模式在配置页用中文选项，发给 NAI 时再翻成官方值
+_PRECISE_MODE_TO_NAI = {
+    "仅角色": "character",
+    "仅风格": "style",
+    "角色与风格": "character&style",
+}
+_PRECISE_MODE_LEGACY = {
+    "character": "仅角色",
+    "style": "仅风格",
+    "character&style": "角色与风格",
+    "both": "角色与风格",
+    "角色": "仅角色",
+    "人物": "仅角色",
+    "画风": "仅风格",
+    "风格": "仅风格",
+    "两者": "角色与风格",
+}
 
 V4_STYLE_MODELS = {
     "nai-diffusion-4", "nai-diffusion-4-curated-preview",
@@ -154,11 +174,20 @@ class NovelAIConfig(ConfigBase):
     IMG2IMG_NOISE: float = Field(default=0.2, title="图生图噪声", description="图生图噪声 (0.0-1.0)。", ge=0.0, le=1.0)
     CHAR_SWAP_STRENGTH: float = Field(default=0.65, title="来点-图生图强度", description="来点换人物时的图生图强度 (0.1-0.9)，越大越偏离原图。", ge=0.1, le=0.9)
     CHAR_SWAP_NOISE: float = Field(default=0.2, title="来点-图生图噪声", description="来点换人物时的图生图噪声 (0.0-1.0)。", ge=0.0, le=1.0)
-    PRECISE_REF_MODE: str = Field(
-        default="character",
+    PRECISE_REF_MODE: PRECISE_MODE_CHOICES = Field(
+        default="仅角色",
         title="精准参考-默认参考模式",
-        description="未在指令里指定时使用。character = 仅角色，style = 仅风格，character&style = 角色与风格。",
+        description="未在指令里指定时使用：仅角色 = 只锁长相，仅风格 = 只锁画风，角色与风格 = 两者都要。",
     )
+
+    @field_validator("PRECISE_REF_MODE", mode="before")
+    @classmethod
+    def _normalize_precise_mode(cls, value: Any) -> str:
+        """兼容旧配置里的 character / style / character&style 写法。"""
+        text = str(value or "").strip()
+        if text in _PRECISE_MODE_TO_NAI:
+            return text
+        return _PRECISE_MODE_LEGACY.get(text.lower(), "仅角色")
     PRECISE_STRENGTH: float = Field(
         default=0.9,
         title="精准参考-默认影响强度",
@@ -1039,12 +1068,9 @@ def _extract_ref_type(prompt: str) -> tuple:
 # ==================== 精准参考：参考模式 / 影响强度 / 保真度 ====================
 # 与图库网站 draw 页「精准参考」卡片上的三个旋钮一一对应；
 # 默认值放在插件配置页（PRECISE_REF_MODE / PRECISE_STRENGTH / PRECISE_FIDELITY）。
-_PRECISE_MODES = ("character", "style", "character&style")
-
-
 def _config_precise_mode() -> str:
     value = str(getattr(config, "PRECISE_REF_MODE", "") or "").strip()
-    return value if value in _PRECISE_MODES else "character"
+    return _PRECISE_MODE_TO_NAI.get(value, "character")
 
 
 def _config_precise_strength() -> float:
