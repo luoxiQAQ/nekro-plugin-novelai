@@ -41,7 +41,7 @@ _plugin_kwargs: dict = dict(
     name="NovelAI 画图",
     module_name="novelai",
     description="NovelAI 文生图/图生图/精准参考插件，支持 NAI v3/v4/v4.5/v5 模型。",
-    version="1.8.6",
+    version="1.8.7",
     author="luoxi",
     url="",
     i18n_name=i18n.i18n_text(zh_CN="NovelAI 画图", en_US="NovelAI Image"),
@@ -905,12 +905,12 @@ def _prepare_precise_image(raw: bytes) -> bytes:
 
 async def _call_precise_reference(prompt, refs, ref_type="character", strength=0.9, fidelity=0.7,
                                   width=0, height=0, steps=0, scale=0, model="", negative_prompt=""):
-    """NovelAI 精准参考（director reference）：multipart 上传参考图，仅 V4.5 支持。"""
+    """NovelAI 精准参考（director reference）：multipart 上传参考图，V4.5 / V5 系列均支持。"""
     if config.API_MODE == "openai" and not (config.API_PROXY or "").strip():
         raise Exception("精准参考需要 NAI 原生接口，请在插件设置里填写 API 反代地址")
     model = _resolve_model(model)
-    if not str(model).startswith("nai-diffusion-4-5"):
-        model = "nai-diffusion-4-5-full"
+    if not (str(model).startswith("nai-diffusion-4-5") or str(model).startswith("nai-diffusion-5")):
+        model = "nai-diffusion-4-5-full"  # V4 / V3 不支持参考图
     dw, dh = _parse_resolution()
     width, height = width or dw, height or dh
     steps = steps or config.DEFAULT_STEPS
@@ -1334,7 +1334,7 @@ async def cmd_draw(
 
 @plugin.mount_command(
     name="精准参考画图",
-    description="带/回复参考图 + 提示词，用 NovelAI 精准参考生成（仅 V4.5，按次额外计费）",
+    description="带/回复参考图 + 提示词，用 NovelAI 精准参考生成（V4.5 / V5，按次额外计费）",
     aliases=["精准参考", "precise"],
     permission=CommandPermission.PUBLIC,
     usage="精准参考画图 <提示词> [竖/方/横] [角色|风格|两者] [强度0-1] [保真0-1]（图片与命令同发，或先回复一张图）",
@@ -1374,8 +1374,9 @@ async def cmd_precise_draw(
         yield CmdCtl.failed("没找到参考图。把图片和命令一起发，或先回复一张图片再发 /精准参考画图。")
         return
     type_cn = {"character": "仅角色", "style": "仅风格", "character&style": "角色与风格"}[ref_type]
+    model_cn = "V5" if str(_resolve_model("")).startswith("nai-diffusion-5") else "V4.5"
     yield CmdCtl.message(
-        f"🎨 精准参考生成中（{len(images)} 张参考图 · {type_cn} · 强度 {strength:.2f} · 保真 {fidelity:.2f} · V4.5），"
+        f"🎨 精准参考生成中（{len(images)} 张参考图 · {type_cn} · 强度 {strength:.2f} · 保真 {fidelity:.2f} · {model_cn}），"
         "按次额外消耗 Anlas，请稍候…"
     )
     try:
@@ -1392,10 +1393,11 @@ async def cmd_precise_draw(
             image_data, _chat_key_of(context), clean_prompt.strip(),
             draw_info.get("width") or width, draw_info.get("height") or height,
         )
+        done_model = "V5" if "nai-diffusion-5" in str(draw_info.get("model", "")) else "V4.5"
         yield CmdCtl.success([
             CommandOutputSegment(
                 type=CommandOutputSegmentType.TEXT,
-                text=f"精准参考完成（V4.5 · {type_cn} · 强度 {strength:.2f} · 保真 {fidelity:.2f} · {len(images)} 张参考图）",
+                text=f"精准参考完成（{done_model} · {type_cn} · 强度 {strength:.2f} · 保真 {fidelity:.2f} · {len(images)} 张参考图）",
             ),
             CommandOutputSegment(type=CommandOutputSegmentType.IMAGE, file_path=abs_path),
         ])
