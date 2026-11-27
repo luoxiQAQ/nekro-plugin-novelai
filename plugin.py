@@ -41,7 +41,7 @@ _plugin_kwargs: dict = dict(
     name="NovelAI 画图",
     module_name="novelai",
     description="NovelAI 文生图/图生图/精准参考插件，支持 NAI v3/v4/v4.5/v5 模型。",
-    version="1.8.7",
+    version="1.8.8",
     author="luoxi",
     url="",
     i18n_name=i18n.i18n_text(zh_CN="NovelAI 画图", en_US="NovelAI Image"),
@@ -174,6 +174,11 @@ class NovelAIConfig(ConfigBase):
     IMG2IMG_NOISE: float = Field(default=0.2, title="图生图噪声", description="图生图噪声 (0.0-1.0)。", ge=0.0, le=1.0)
     CHAR_SWAP_STRENGTH: float = Field(default=0.65, title="来点-图生图强度", description="来点换人物时的图生图强度 (0.1-0.9)，越大越偏离原图。", ge=0.1, le=0.9)
     CHAR_SWAP_NOISE: float = Field(default=0.2, title="来点-图生图噪声", description="来点换人物时的图生图噪声 (0.0-1.0)。", ge=0.0, le=1.0)
+    PRECISE_MODEL: MODEL_CHOICES = Field(
+        default="nai-diffusion-5-full",
+        title="精准参考-模型",
+        description="精准参考单独用的模型。V4.5 / V5 系列都支持参考图；留 V4 会被自动回退到 V4.5 全量。",
+    )
     PRECISE_REF_MODE: PRECISE_MODE_CHOICES = Field(
         default="仅角色",
         title="精准参考-默认参考模式",
@@ -908,7 +913,7 @@ async def _call_precise_reference(prompt, refs, ref_type="character", strength=0
     """NovelAI 精准参考（director reference）：multipart 上传参考图，V4.5 / V5 系列均支持。"""
     if config.API_MODE == "openai" and not (config.API_PROXY or "").strip():
         raise Exception("精准参考需要 NAI 原生接口，请在插件设置里填写 API 反代地址")
-    model = _resolve_model(model)
+    model = _resolve_model(model or getattr(config, "PRECISE_MODEL", "") or "nai-diffusion-5-full")
     if not (str(model).startswith("nai-diffusion-4-5") or str(model).startswith("nai-diffusion-5")):
         model = "nai-diffusion-4-5-full"  # V4 / V3 不支持参考图
     dw, dh = _parse_resolution()
@@ -1374,7 +1379,7 @@ async def cmd_precise_draw(
         yield CmdCtl.failed("没找到参考图。把图片和命令一起发，或先回复一张图片再发 /精准参考画图。")
         return
     type_cn = {"character": "仅角色", "style": "仅风格", "character&style": "角色与风格"}[ref_type]
-    model_cn = "V5" if str(_resolve_model("")).startswith("nai-diffusion-5") else "V4.5"
+    model_cn = "V5" if str(_resolve_model(getattr(config, "PRECISE_MODEL", ""))).startswith("nai-diffusion-5") else "V4.5"
     yield CmdCtl.message(
         f"🎨 精准参考生成中（{len(images)} 张参考图 · {type_cn} · 强度 {strength:.2f} · 保真 {fidelity:.2f} · {model_cn}），"
         "按次额外消耗 Anlas，请稍候…"
