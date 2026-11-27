@@ -41,7 +41,7 @@ _plugin_kwargs: dict = dict(
     name="NovelAI 画图",
     module_name="novelai",
     description="NovelAI 文生图/图生图/精准参考插件，支持 NAI v3/v4/v4.5/v5 模型。",
-    version="1.8.1",
+    version="1.8.2",
     author="luoxi",
     url="",
     i18n_name=i18n.i18n_text(zh_CN="NovelAI 画图", en_US="NovelAI Image"),
@@ -1100,23 +1100,47 @@ def _blacklist_reason(context) -> str:
 # ==================== 实例限制（可选，配置 ONLY_INSTANCE_ID） ====================
 # 多账号共用同一个 nekro 部署时，chat_key 形如 "onebot_v11-<实例标识>:<kind>_<id>"。
 # 配置 ONLY_INSTANCE_ID 后本插件只响应来自该实例的消息，其余实例一律静默不响应；留空则不做限制。
-def _is_main_instance(chat_key) -> bool:
-    """判断会话是否允许触发本插件（实例限制可选，见配置 ONLY_INSTANCE_ID）。
+_CHAT_KEY_RE = re.compile(r"^(?P<adapter>[a-z0-9_]+)-(?:(?P<bot_id>\d+)[:\-])?(?P<scope>group|private)_\d+$")
 
-    未配置限制时一律返回 True；配置后仅该实例标识的会话可通过，
-    无实例前缀的历史数据、非 onebot 渠道一律返回 False。
+
+def _running_bot_ids() -> set[str]:
+    """取当前进程里在线的机器人号（nonebot 侧 self_id）。"""
+    try:
+        from nonebot import get_bots
+
+        return {str(getattr(bot, "self_id", "") or "") for bot in get_bots().values()}
+    except Exception:
+        return set()
+
+
+def _is_main_instance(chat_key) -> bool:
+    """判断当前会话是否属于 ONLY_INSTANCE_ID 指定的机器人实例。
+
+    未配置 ONLY_INSTANCE_ID 时一律放行。
+
+    注意 chat_key 的两种形态（nekro 的 onebot 适配器默认**不含**机器人号）：
+      onebot_v11-group_236598679              ← 本站实际形态
+      onebot_v11-3692682071:group_236598679   ← 带机器人号（部分版本）
+    不含机器人号时改看当前在线机器人的 self_id，避免「配置了实例限制就全哑火」。
+    无法判断时放行（宁可按实例多发，也不要一声不吭）。
     """
     target = str(getattr(config, "ONLY_INSTANCE_ID", "") or "").strip()
     if not target:
         return True
-    if not chat_key:
+    text = str(chat_key or "").strip()
+    if not text:
         return False
-    text = str(chat_key)
-    raw = text.split("-", 1)[-1] if "-" in text else text
-    scope, sep, rest = raw.partition(":")
-    if not sep or not rest.startswith(("group_", "private_")):
+    match = _CHAT_KEY_RE.match(text)
+    if match is None:
+        return True
+    bot_id = match.group("bot_id")
+    if bot_id:
+        return bot_id == target
+    running = _running_bot_ids()
+    if running and target not in running:
+        logger.info(f"NovelAI: 当前在线机器人 {sorted(running)} 不含配置实例 {target}，跳过")
         return False
-    return scope == target
+    return True
 
 def _blacklist_save(entries: dict) -> None:
     config.DRAW_BLACKLIST = "\n".join(f"{number} {note}".strip() for number, note in entries.items())
