@@ -40,13 +40,13 @@ import inspect as _inspect
 _plugin_kwargs: dict = dict(
     name="NovelAI 画图",
     module_name="novelai",
-    description="NovelAI 文生图/图生图插件，支持 NAI v3/v4/v4.5/v5 模型。",
-    version="1.7.0",
+    description="NovelAI 文生图/图生图/精准参考插件，支持 NAI v3/v4/v4.5/v5 模型。",
+    version="1.8.0",
     author="luoxi",
     url="",
     i18n_name=i18n.i18n_text(zh_CN="NovelAI 画图", en_US="NovelAI Image"),
     i18n_description=i18n.i18n_text(
-        zh_CN="NovelAI 文生图/图生图插件，支持 NAI v3/v4/v4.5/v5 模型，内置翻译和 R18 开关。",
+        zh_CN="NovelAI 文生图/图生图/精准参考插件，支持 NAI v3/v4/v4.5/v5 模型，内置翻译和 R18 开关。",
         en_US="NovelAI text-to-image and image-to-image plugin with translation and R18 toggle.",
     ),
     webui_path="/",
@@ -844,6 +844,198 @@ async def _call_img2img(prompt, image_b64, width=0, height=0, steps=0, scale=0, 
             raise Exception(f"NovelAI API 错误: {response.status_code} {response.text[:200]}")
 
 
+def _get_precise_api_url() -> str:
+    """精准参考要打 NAI 原生接口；反代填成 /v1（OpenAI 风格）时也要落回站点根路径。"""
+    base = (config.API_PROXY or "").strip().rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    if base:
+        return f"{base}/ai/generate-image"
+    return f"{NAI_API_BASE}/ai/generate-image"
+
+
+PRECISE_CANVASES = ((1024, 1536), (1472, 1472), (1536, 1024))
+
+
+def _prepare_precise_image(raw: bytes) -> bytes:
+    """把参考图等比缩放、居中补边到官方画布（1024×1536 / 1472×1472 / 1536×1024）。"""
+    from PIL import Image as PILImage
+
+    with PILImage.open(io.BytesIO(raw)) as img:
+        img.load()
+        rgb = img.convert("RGB")
+    ratio = (rgb.width / rgb.height) if rgb.height else 1.0
+    cw, ch = min(PRECISE_CANVASES, key=lambda c: abs((c[0] / c[1]) - ratio))
+    rgb.thumbnail((cw, ch), PILImage.LANCZOS)
+    canvas = PILImage.new("RGB", (cw, ch), (0, 0, 0))
+    canvas.paste(rgb, ((cw - rgb.width) // 2, (ch - rgb.height) // 2))
+    buf = io.BytesIO()
+    canvas.save(buf, "PNG")
+    return buf.getvalue()
+
+
+async def _call_precise_reference(prompt, refs, ref_type="character", strength=0.9, fidelity=0.7,
+                                  width=0, height=0, steps=0, scale=0, model="", negative_prompt=""):
+    """NovelAI 精准参考（director reference）：multipart 上传参考图，仅 V4.5 支持。"""
+    if config.API_MODE == "openai" and not (config.API_PROXY or "").strip():
+        raise Exception("精准参考需要 NAI 原生接口，请在插件设置里填写 API 反代地址")
+    model = _resolve_model(model)
+    if not str(model).startswith("nai-diffusion-4-5"):
+        model = "nai-diffusion-4-5-full"
+    dw, dh = _parse_resolution()
+    width, height = width or dw, height or dh
+    steps = steps or config.DEFAULT_STEPS
+    scale = scale or config.DEFAULT_SCALE
+    raw_prompt = prompt
+    prompt = await _translate_prompt(_expand_preset_prompt(prompt))
+    params = _build_parameters(prompt, width, height, steps, scale, config.DEFAULT_SAMPLER, model, negative_prompt)
+    prepared = [_prepare_precise_image(raw) for raw in refs if raw]
+    if not prepared:
+        raise Exception("参考图解析失败，请换一张图片重试")
+    if ref_type not in ("character", "style", "character&style"):
+        ref_type = "character"
+    strength = round(min(max(float(strength), 0.0), 1.0), 2)
+    fidelity = round(min(max(float(fidelity), 0.0), 1.0), 2)
+    n = len(prepared)
+    params["director_reference_images_cached"] = [
+        {"cache_secret_key": None, "data": f"director_ref_{i}"} for i in range(n)
+    ]
+    params["director_reference_descriptions"] = [
+        {"caption": {"base_caption": ref_type, "char_captions": []}, "legacy_uc": False} for _ in range(n)
+    ]
+    # 官方校验该值必须正好 1.0，传别的一律 400
+    params["director_reference_information_extracted"] = [1.0] * n
+    params["director_reference_strength_values"] = [strength] * n
+    params["director_reference_secondary_strength_values"] = [round(1.0 - fidelity, 2)] * n
+    params["normalize_reference_strength_multiple"] = True
+    payload = {"input": prompt, "model": model, "action": "generate", "parameters": params}
+    info = {
+        "raw_prompt": raw_prompt,
+        "prompt": prompt,
+        "negative_prompt": _get_negative_prompt(negative_prompt),
+        "width": width,
+        "height": height,
+        "steps": steps,
+        "scale": scale,
+        "sampler": config.DEFAULT_SAMPLER,
+        "model": model,
+        "seed": params.get("seed"),
+        "image_type": "precise_reference",
+        "ref_type": ref_type,
+        "ref_strength": strength,
+        "ref_fidelity": fidelity,
+        "precise_refs": n,
+    }
+    api_url = _get_precise_api_url()
+    files = [(f"director_ref_{i}", (f"director_ref_{i}.png", data, "image/png"))
+             for i, data in enumerate(prepared)]
+    form = {"request": json.dumps(payload, ensure_ascii=False)}
+    client_cfg = _build_client_config()
+    client_cfg["timeout"] = httpx.Timeout(180.0, connect=30.0)
+    last_error = ""
+    async with httpx.AsyncClient(**client_cfg) as client:
+        for retry in range(2):
+            headers = _build_headers()
+            headers.pop("Content-Type", None)
+            try:
+                response = await client.post(api_url, headers=headers, data=form, files=files)
+            except httpx.RequestError as exc:
+                last_error = str(exc)
+                if retry == 0:
+                    await asyncio.sleep(1.0)
+                    continue
+                raise Exception(f"NovelAI 网络错误: {exc}") from exc
+            if response.status_code == 200:
+                img = _extract_image(response.content)
+                if img is None:
+                    raise Exception("无法从响应中提取图片")
+                logger.info(f"NovelAI 精准参考成功: model={model}, refs={n}, type={ref_type}")
+                return img, info
+            last_error = f"HTTP {response.status_code}: {response.text[:200]}"
+            if response.status_code in (401, 402, 429) and retry == 0 and _rotate_token(last_error):
+                continue
+            break
+    raise Exception(f"精准参考请求失败: {last_error}")
+
+
+async def _images_from_message(message: Any, limit: int = 4) -> List[bytes]:
+    if message is None:
+        return []
+    content_data = getattr(message, "content_data", None)
+    if isinstance(content_data, str):
+        try:
+            content_data = message.parse_content_data()
+        except Exception:
+            content_data = []
+    images: List[bytes] = []
+    for segment in content_data or []:
+        if len(images) >= limit:
+            break
+        if _segment_type_of(segment) != "image":
+            continue
+        image_bytes = await _load_image_bytes(
+            _segment_field(segment, "local_path"),
+            _segment_field(segment, "remote_url"),
+        )
+        if image_bytes:
+            images.append(image_bytes)
+    return images
+
+
+async def _resolve_reference_images(context: CommandExecutionContext, limit: int = 4) -> List[bytes]:
+    """收集参考图：命令消息自带的图（可多张），或者被引用消息里的图。"""
+    chat_key = _chat_key_of(context)
+    current = _current_command_message.get()
+    command_message = None
+    if current and current.get("chat_key") == chat_key and str(current.get("user_id")) == str(context.user_id):
+        command_message = current.get("platform_message")
+    if command_message is not None:
+        images = await _images_from_message(command_message, limit)
+        if images:
+            return images
+        ref_msg_id = _message_ref_id(command_message)
+        if ref_msg_id:
+            ref_message = await _referenced_db_message(chat_key, ref_msg_id)
+            if ref_message is not None:
+                images = await _images_from_message(ref_message, limit)
+                if images:
+                    return images
+            cached = await _image_bytes_from_cache(chat_key, ref_msg_id)
+            if cached:
+                return [cached]
+    return []
+
+
+_REF_TYPE_WORDS = {
+    "角色与风格": "character&style",
+    "两者": "character&style",
+    "都要": "character&style",
+    "画风": "style",
+    "风格": "style",
+    "人物": "character",
+    "角色": "character",
+}
+
+
+def _extract_ref_type(prompt: str) -> tuple:
+    """摘出参考模式关键词（按词边界匹配，避免误伤正文），返回 (剩余提示词, 模式)。"""
+    delims = set(" ,，、\t\n")
+    for word in ("角色与风格", "两者", "都要", "画风", "风格", "人物", "角色"):
+        start = 0
+        while True:
+            idx = prompt.find(word, start)
+            if idx < 0:
+                break
+            before_ok = idx == 0 or prompt[idx - 1] in delims
+            after_idx = idx + len(word)
+            after_ok = after_idx >= len(prompt) or prompt[after_idx] in delims
+            if before_ok and after_ok:
+                rest = (prompt[:idx] + prompt[after_idx:]).strip(" ,，、\t\n")
+                return rest, _REF_TYPE_WORDS[word]
+            start = idx + 1
+    return prompt, "character"
+
+
 async def _forward_result(ctx: AgentCtx, image_data: bytes, fmt: str = "png") -> str:
     shared_root = Path(ctx.fs.shared_path).resolve()
     shared_root.mkdir(parents=True, exist_ok=True)
@@ -1054,6 +1246,71 @@ async def cmd_draw(
         abs_path = _save_generated(image_data, _chat_key_of(context), prompt, width, height)
         yield CmdCtl.success([
             CommandOutputSegment(type=CommandOutputSegmentType.TEXT, text="NovelAI 画图完成"),
+            CommandOutputSegment(type=CommandOutputSegmentType.IMAGE, file_path=abs_path),
+        ])
+    except Exception:
+        yield CmdCtl.failed("图片保存失败")
+
+
+@plugin.mount_command(
+    name="精准参考画图",
+    description="带/回复参考图 + 提示词，用 NovelAI 精准参考生成（仅 V4.5，按次额外计费）",
+    aliases=["精准参考", "precise"],
+    permission=CommandPermission.PUBLIC,
+    usage="精准参考画图 <提示词> [竖/方/横] [角色|风格|两者]（图片与命令同发，或先回复一张图）",
+)
+async def cmd_precise_draw(
+    context: CommandExecutionContext,
+    prompt: Annotated[str, Arg("画图提示词", positional=True, greedy=True)] = "",
+) -> AsyncIterator[CommandResponse]:
+    """NovelAI 精准参考（角色/风格参考）：图片和命令一起发，或回复一张图再发命令。
+
+    默认按「仅角色」参考，末尾加「风格」或「两者」可切换参考模式。
+    """
+    if not _is_main_instance(_chat_key_of(context)):
+        return
+    blocked = _blacklist_reason(context)
+    if blocked:
+        yield CmdCtl.failed(f"画图功能已对{blocked}禁用。")
+        return
+    if not prompt.strip():
+        yield CmdCtl.failed(
+            "请提供画图提示词，并把参考图和命令一起发（或先回复一张图）：\n"
+            "/精准参考画图 白裙少女站在花田 竖\n"
+            "末尾加「风格」= 只参考画风，「两者」= 角色与画风一起参考"
+        )
+        return
+    clean_prompt, width, height = _extract_draw_params(prompt)
+    clean_prompt, ref_type = _extract_ref_type(clean_prompt)
+    if not clean_prompt.strip():
+        yield CmdCtl.failed("提示词不能为空，请描述想要的画面。")
+        return
+    images = await _resolve_reference_images(context, limit=4)
+    if not images:
+        yield CmdCtl.failed("没找到参考图。把图片和命令一起发，或先回复一张图片再发 /精准参考画图。")
+        return
+    type_cn = {"character": "仅角色", "style": "仅风格", "character&style": "角色与风格"}[ref_type]
+    yield CmdCtl.message(
+        f"🎨 精准参考生成中（{len(images)} 张参考图 · {type_cn} · V4.5），按次额外消耗 Anlas，请稍候…"
+    )
+    try:
+        image_data, draw_info = await _call_precise_reference(
+            prompt=clean_prompt.strip(), refs=images, ref_type=ref_type,
+            width=width, height=height,
+        )
+    except Exception as exc:
+        yield CmdCtl.failed(f"精准参考画图失败: {exc}")
+        return
+    try:
+        abs_path = _save_generated(
+            image_data, _chat_key_of(context), clean_prompt.strip(),
+            draw_info.get("width") or width, draw_info.get("height") or height,
+        )
+        yield CmdCtl.success([
+            CommandOutputSegment(
+                type=CommandOutputSegmentType.TEXT,
+                text=f"精准参考完成（V4.5 · {type_cn} · {len(images)} 张参考图）",
+            ),
             CommandOutputSegment(type=CommandOutputSegmentType.IMAGE, file_path=abs_path),
         ])
     except Exception:
