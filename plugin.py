@@ -41,7 +41,7 @@ _plugin_kwargs: dict = dict(
     name="NovelAI 画图",
     module_name="novelai",
     description="NovelAI 文生图/图生图/精准参考插件，支持 NAI v3/v4/v4.5/v5 模型。",
-    version="1.8.3",
+    version="1.8.4",
     author="luoxi",
     url="",
     i18n_name=i18n.i18n_text(zh_CN="NovelAI 画图", en_US="NovelAI Image"),
@@ -1017,6 +1017,68 @@ def _extract_ref_type(prompt: str) -> tuple:
     return prompt, "character"
 
 
+# ==================== 精准参考：参考模式 / 影响强度 / 保真度 ====================
+# 与图库网站 draw 页「精准参考」卡片上的三个旋钮一一对应。
+PRECISE_DEFAULT_STRENGTH = 0.9   # 网站默认 1.0，这里略低一点，减少参考图服装盖过提示词
+PRECISE_DEFAULT_FIDELITY = 0.7   # 同上。想要和网站完全一致就显式写「强度1 保真1」
+
+_PRECISE_STRENGTH_RE = re.compile(r"(?:影响强度|参考强度|强度|strength)\s*[=:：]?\s*(\d{1,3}(?:\.\d+)?)", re.I)
+_PRECISE_FIDELITY_RE = re.compile(r"(?:保真度|保真|fidelity)\s*[=:：]?\s*(\d{1,3}(?:\.\d+)?)", re.I)
+_PRECISE_MODE_RE = re.compile(r"(?:参考)?模式\s*[=:：]?\s*(仅角色与风格|角色与风格|仅角色|仅风格|两者|角色|风格)", re.I)
+
+_PRECISE_MODE_WORDS = {
+    "仅角色与风格": "character&style",
+    "角色与风格": "character&style",
+    "两者": "character&style",
+    "仅角色": "character",
+    "角色": "character",
+    "仅风格": "style",
+    "风格": "style",
+}
+
+
+def _norm01(raw: str) -> float:
+    """把 0.8 / 80 / 1 都归一成 0~1。"""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if value > 1:
+        value = value / 100 if value <= 100 else 1.0
+    return round(min(max(value, 0.0), 1.0), 2)
+
+
+def _extract_precise_params(prompt: str) -> tuple:
+    """摘出「参考模式 / 影响强度 / 保真度」，返回 (剩余提示词, 模式, 强度, 保真度)。
+
+    支持写法：模式=仅角色 / 参考模式：角色与风格 / 强度0.8 / 影响强度=0.8 / strength=0.8
+             保真0.6 / 保真度：0.6 / fidelity=0.6
+    没写的项返回 None，由调用方套默认值。
+    """
+    strength = None
+    fidelity = None
+    mode = None
+
+    match = _PRECISE_STRENGTH_RE.search(prompt)
+    if match:
+        strength = _norm01(match.group(1))
+        prompt = prompt[: match.start()] + prompt[match.end():]
+
+    match = _PRECISE_FIDELITY_RE.search(prompt)
+    if match:
+        fidelity = _norm01(match.group(1))
+        prompt = prompt[: match.start()] + prompt[match.end():]
+
+    match = _PRECISE_MODE_RE.search(prompt)
+    if match:
+        mode = _PRECISE_MODE_WORDS.get(match.group(1), "character")
+        prompt = prompt[: match.start()] + prompt[match.end():]
+    else:
+        prompt, mode = _extract_ref_type(prompt)
+
+    return prompt.strip(" ,，、\t\n"), mode, strength, fidelity
+
+
 async def _forward_result(ctx: AgentCtx, image_data: bytes, fmt: str = "png") -> str:
     shared_root = Path(ctx.fs.shared_path).resolve()
     shared_root.mkdir(parents=True, exist_ok=True)
@@ -1215,7 +1277,7 @@ async def cmd_draw(
     description="带/回复参考图 + 提示词，用 NovelAI 精准参考生成（仅 V4.5，按次额外计费）",
     aliases=["精准参考", "precise"],
     permission=CommandPermission.PUBLIC,
-    usage="精准参考画图 <提示词> [竖/方/横] [角色|风格|两者]（图片与命令同发，或先回复一张图）",
+    usage="精准参考画图 <提示词> [竖/方/横] [角色|风格|两者] [强度0-1] [保真0-1]（图片与命令同发，或先回复一张图）",
 )
 async def cmd_precise_draw(
     context: CommandExecutionContext,
@@ -1223,7 +1285,10 @@ async def cmd_precise_draw(
 ) -> AsyncIterator[CommandResponse]:
     """NovelAI 精准参考（角色/风格参考）：图片和命令一起发，或回复一张图再发命令。
 
-    默认按「仅角色」参考，末尾加「风格」或「两者」可切换参考模式。
+    三个旋钮与网站 draw 页的「精准参考」卡片一致：
+      参考模式 = 仅角色 / 仅风格 / 角色与风格（也可写 模式=仅角色）
+      影响强度 = 强度0.8（0~1，默认 0.9）
+      保真度   = 保真0.6（0~1，默认 0.7）
     """
     blocked = _blacklist_reason(context)
     if blocked:
@@ -1232,12 +1297,14 @@ async def cmd_precise_draw(
     if not prompt.strip():
         yield CmdCtl.failed(
             "请提供画图提示词，并把参考图和命令一起发（或先回复一张图）：\n"
-            "/精准参考画图 白裙少女站在花田 竖\n"
-            "末尾加「风格」= 只参考画风，「两者」= 角色与画风一起参考"
+            "/精准参考画图 白裙少女站在花田 竖 角色 强度0.9 保真0.6\n"
+            "参考模式：角色（仅锁人）/ 风格（仅锁画风）/ 两者；强度与保真取 0~1，不写就用 0.9 / 0.7"
         )
         return
     clean_prompt, width, height = _extract_draw_params(prompt)
-    clean_prompt, ref_type = _extract_ref_type(clean_prompt)
+    clean_prompt, ref_type, strength_in, fidelity_in = _extract_precise_params(clean_prompt)
+    strength = PRECISE_DEFAULT_STRENGTH if strength_in is None else strength_in
+    fidelity = PRECISE_DEFAULT_FIDELITY if fidelity_in is None else fidelity_in
     if not clean_prompt.strip():
         yield CmdCtl.failed("提示词不能为空，请描述想要的画面。")
         return
@@ -1247,11 +1314,13 @@ async def cmd_precise_draw(
         return
     type_cn = {"character": "仅角色", "style": "仅风格", "character&style": "角色与风格"}[ref_type]
     yield CmdCtl.message(
-        f"🎨 精准参考生成中（{len(images)} 张参考图 · {type_cn} · V4.5），按次额外消耗 Anlas，请稍候…"
+        f"🎨 精准参考生成中（{len(images)} 张参考图 · {type_cn} · 强度 {strength:.2f} · 保真 {fidelity:.2f} · V4.5），"
+        "按次额外消耗 Anlas，请稍候…"
     )
     try:
         image_data, draw_info = await _call_precise_reference(
             prompt=clean_prompt.strip(), refs=images, ref_type=ref_type,
+            strength=strength, fidelity=fidelity,
             width=width, height=height,
         )
     except Exception as exc:
@@ -1265,7 +1334,7 @@ async def cmd_precise_draw(
         yield CmdCtl.success([
             CommandOutputSegment(
                 type=CommandOutputSegmentType.TEXT,
-                text=f"精准参考完成（V4.5 · {type_cn} · {len(images)} 张参考图）",
+                text=f"精准参考完成（V4.5 · {type_cn} · 强度 {strength:.2f} · 保真 {fidelity:.2f} · {len(images)} 张参考图）",
             ),
             CommandOutputSegment(type=CommandOutputSegmentType.IMAGE, file_path=abs_path),
         ])
