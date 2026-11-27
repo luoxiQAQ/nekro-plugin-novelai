@@ -41,7 +41,7 @@ _plugin_kwargs: dict = dict(
     name="NovelAI 画图",
     module_name="novelai",
     description="NovelAI 文生图/图生图/精准参考插件，支持 NAI v3/v4/v4.5/v5 模型。",
-    version="1.8.4",
+    version="1.8.5",
     author="luoxi",
     url="",
     i18n_name=i18n.i18n_text(zh_CN="NovelAI 画图", en_US="NovelAI Image"),
@@ -154,6 +154,25 @@ class NovelAIConfig(ConfigBase):
     IMG2IMG_NOISE: float = Field(default=0.2, title="图生图噪声", description="图生图噪声 (0.0-1.0)。", ge=0.0, le=1.0)
     CHAR_SWAP_STRENGTH: float = Field(default=0.65, title="来点-图生图强度", description="来点换人物时的图生图强度 (0.1-0.9)，越大越偏离原图。", ge=0.1, le=0.9)
     CHAR_SWAP_NOISE: float = Field(default=0.2, title="来点-图生图噪声", description="来点换人物时的图生图噪声 (0.0-1.0)。", ge=0.0, le=1.0)
+    PRECISE_REF_MODE: str = Field(
+        default="character",
+        title="精准参考-默认参考模式",
+        description="未在指令里指定时使用。character = 仅角色，style = 仅风格，character&style = 角色与风格。",
+    )
+    PRECISE_STRENGTH: float = Field(
+        default=0.9,
+        title="精准参考-默认影响强度",
+        description="未在指令里写「强度x」时使用 (0.0-1.0)。越大越贴参考图；网站默认 1.0。",
+        ge=0.0,
+        le=1.0,
+    )
+    PRECISE_FIDELITY: float = Field(
+        default=0.7,
+        title="精准参考-默认保真度",
+        description="未在指令里写「保真x」时使用 (0.0-1.0)。越大越照抄参考图细节（含服装）；网站默认 1.0。",
+        ge=0.0,
+        le=1.0,
+    )
     ENABLE_R18: bool = Field(
         default=False,
         title="R18 画图开关",
@@ -1018,9 +1037,22 @@ def _extract_ref_type(prompt: str) -> tuple:
 
 
 # ==================== 精准参考：参考模式 / 影响强度 / 保真度 ====================
-# 与图库网站 draw 页「精准参考」卡片上的三个旋钮一一对应。
-PRECISE_DEFAULT_STRENGTH = 0.9   # 网站默认 1.0，这里略低一点，减少参考图服装盖过提示词
-PRECISE_DEFAULT_FIDELITY = 0.7   # 同上。想要和网站完全一致就显式写「强度1 保真1」
+# 与图库网站 draw 页「精准参考」卡片上的三个旋钮一一对应；
+# 默认值放在插件配置页（PRECISE_REF_MODE / PRECISE_STRENGTH / PRECISE_FIDELITY）。
+_PRECISE_MODES = ("character", "style", "character&style")
+
+
+def _config_precise_mode() -> str:
+    value = str(getattr(config, "PRECISE_REF_MODE", "") or "").strip()
+    return value if value in _PRECISE_MODES else "character"
+
+
+def _config_precise_strength() -> float:
+    return _norm01(getattr(config, "PRECISE_STRENGTH", 0.9))
+
+
+def _config_precise_fidelity() -> float:
+    return _norm01(getattr(config, "PRECISE_FIDELITY", 0.7))
 
 _PRECISE_STRENGTH_RE = re.compile(r"(?:影响强度|参考强度|强度|strength)\s*[=:：]?\s*(\d{1,3}(?:\.\d+)?)", re.I)
 _PRECISE_FIDELITY_RE = re.compile(r"(?:保真度|保真|fidelity)\s*[=:：]?\s*(\d{1,3}(?:\.\d+)?)", re.I)
@@ -1074,7 +1106,9 @@ def _extract_precise_params(prompt: str) -> tuple:
         mode = _PRECISE_MODE_WORDS.get(match.group(1), "character")
         prompt = prompt[: match.start()] + prompt[match.end():]
     else:
-        prompt, mode = _extract_ref_type(prompt)
+        before = prompt
+        prompt, found = _extract_ref_type(prompt)
+        mode = found if prompt != before else None  # 没写就留 None，用配置默认值
 
     return prompt.strip(" ,，、\t\n"), mode, strength, fidelity
 
@@ -1287,8 +1321,8 @@ async def cmd_precise_draw(
 
     三个旋钮与网站 draw 页的「精准参考」卡片一致：
       参考模式 = 仅角色 / 仅风格 / 角色与风格（也可写 模式=仅角色）
-      影响强度 = 强度0.8（0~1，默认 0.9）
-      保真度   = 保真0.6（0~1，默认 0.7）
+      影响强度 = 强度0.8（0~1，默认取插件设置的 PRECISE_STRENGTH）
+      保真度   = 保真0.6（0~1，默认取插件设置的 PRECISE_FIDELITY）
     """
     blocked = _blacklist_reason(context)
     if blocked:
@@ -1298,13 +1332,14 @@ async def cmd_precise_draw(
         yield CmdCtl.failed(
             "请提供画图提示词，并把参考图和命令一起发（或先回复一张图）：\n"
             "/精准参考画图 白裙少女站在花田 竖 角色 强度0.9 保真0.6\n"
-            "参考模式：角色（仅锁人）/ 风格（仅锁画风）/ 两者；强度与保真取 0~1，不写就用 0.9 / 0.7"
+            "参考模式：角色（仅锁人）/ 风格（仅锁画风）/ 两者；强度与保真取 0~1，不写就用插件设置里的默认值"
         )
         return
     clean_prompt, width, height = _extract_draw_params(prompt)
     clean_prompt, ref_type, strength_in, fidelity_in = _extract_precise_params(clean_prompt)
-    strength = PRECISE_DEFAULT_STRENGTH if strength_in is None else strength_in
-    fidelity = PRECISE_DEFAULT_FIDELITY if fidelity_in is None else fidelity_in
+    ref_type = ref_type or _config_precise_mode()
+    strength = _config_precise_strength() if strength_in is None else strength_in
+    fidelity = _config_precise_fidelity() if fidelity_in is None else fidelity_in
     if not clean_prompt.strip():
         yield CmdCtl.failed("提示词不能为空，请描述想要的画面。")
         return
