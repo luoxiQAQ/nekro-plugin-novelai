@@ -41,7 +41,7 @@ _plugin_kwargs: dict = dict(
     name="NovelAI 画图",
     module_name="novelai",
     description="NovelAI 文生图/图生图/精准参考插件，支持 NAI v3/v4/v4.5/v5 模型。",
-    version="1.8.0",
+    version="1.8.1",
     author="luoxi",
     url="",
     i18n_name=i18n.i18n_text(zh_CN="NovelAI 画图", en_US="NovelAI Image"),
@@ -346,68 +346,54 @@ _last_draw: dict[str, dict] = {}
 
 
 def _expand_preset_prompt(prompt: str) -> str:
-    character_names: list[str] = []
-    style_names: list[str] = []
+    """把提示词里的人物/风格预设展开成标签。
 
-    def collect(kind: str, names: list[str], name: str) -> str:
-        name = name.strip()
-        if name and name not in names:
-            names.append(name)
-        return ""
-
-    prompt = re.sub(
-        r"人物\s*=\s*([^\s#@=，,]+)",
-        lambda match: collect("characters", character_names, match.group(1)),
-        prompt,
-    )
-    prompt = re.sub(
-        r"风格\s*=\s*([^\s#@=，,]+)",
-        lambda match: collect("styles", style_names, match.group(1)),
-        prompt,
-    )
-    prompt = re.sub(
-        r"@([^\s#@=，,]+)",
-        lambda match: collect("characters", character_names, match.group(1)),
-        prompt,
-    )
-    prompt = re.sub(
-        r"#([^\s@=，,]+)",
-        lambda match: collect("styles", style_names, match.group(1)),
-        prompt,
-    )
-
+    展开顺序与网站（gallery.py 的 apply_presets）严格一致：
+    人物标签原位替换，画师串（风格）统一追加到末尾。
+    这样同一段提示词在群里和网页上得到的最终 prompt 完全相同。
+    """
     all_presets = preset_store.all()
-    _delimiters = set(" ,，、。！？\t\n")
-    for kind, names_list in (("styles", style_names), ("characters", character_names)):
-        known = sorted(all_presets[kind].keys(), key=len, reverse=True)
-        for name in known:
-            if name in names_list:
-                continue
-            idx = prompt.find(name)
-            if idx < 0:
-                continue
-            before_ok = idx == 0 or prompt[idx - 1] in _delimiters
-            after_idx = idx + len(name)
-            after_ok = after_idx >= len(prompt) or prompt[after_idx] in _delimiters
-            if before_ok and after_ok:
-                names_list.append(name)
-                prompt = prompt[:idx] + prompt[after_idx:]
+    characters = {name.lower(): value for name, value in all_presets["characters"].items()}
+    styles = {name.lower(): value for name, value in all_presets["styles"].items()}
 
-    missing = []
-    expanded = []
-    for kind, names in (("characters", character_names), ("styles", style_names)):
-        for name in names:
-            value = preset_store.get(kind, name)
-            if value is None:
-                missing.append(f"{PRESET_KIND_LABELS[kind]}预设「{name}」")
-            else:
-                expanded.append(value)
+    missing: list[str] = []
+
+    def take(kind: str, raw_name: str) -> str:
+        """校验 @人物 / #风格 / 人物= / 风格= 写法的名字，还原成裸名字。"""
+        name = raw_name.strip()
+        pool = characters if kind == "characters" else styles
+        if name.lower() not in pool:
+            missing.append(f"{PRESET_KIND_LABELS[kind]}预设「{name}」")
+        return name
+
+    prompt = re.sub(r"人物\s*=\s*([^\s#@=，,]+)", lambda m: take("characters", m.group(1)), prompt)
+    prompt = re.sub(r"风格\s*=\s*([^\s#@=，,]+)", lambda m: take("styles", m.group(1)), prompt)
+    prompt = re.sub(r"@([^\s#@=，,]+)", lambda m: take("characters", m.group(1)), prompt)
+    prompt = re.sub(r"#([^\s@=，,]+)", lambda m: take("styles", m.group(1)), prompt)
+
+    kept: list[str] = []
+    used_styles: list[str] = []
+    for part in re.split(r"[,，]", prompt):
+        part = part.strip()
+        if not part:
+            continue
+        key = part.lower()
+        if key in characters:
+            kept.extend(tag.strip() for tag in characters[key].split(",") if tag.strip())
+        elif key in styles:
+            value = styles[key]
+            if value and value not in used_styles:
+                used_styles.append(value)
+        else:
+            kept.append(part)
+
+    result = ", ".join(kept)
+    if used_styles:
+        merged = ", ".join(used_styles)
+        result = (result + ", " + merged) if result else merged
     if missing:
         raise ValueError("未找到" + "、".join(missing))
-
-
-    prompt = re.sub(r"\s+", " ", prompt).strip(" ,，")
-    return ", ".join(expanded + ([prompt] if prompt else []))
+    return result
 
 NSFW_NEGATIVE_TAGS = "nsfw, nude, naked, nipples, pussy, penis, sex, vaginal, anal, oral, cum, ejaculation, pubic hair, genitals, exposed, uncensored"
 
