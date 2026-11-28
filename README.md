@@ -205,6 +205,8 @@ git clone https://github.com/luoxiQAQ/nekro-plugin-novelai.git nekro_plugin_nove
 
 重启 Nekro Agent，在管理面板中配置 API Token 即可使用。
 
+> 兼容性：Nekro Agent `2.3.x` / `2.4.x` 均可直接使用。插件对 `collector._try_handle_command` 在两版之间的签名差异（2.4.x 多一个 `platform_channel` 参数）做了自适应，不绑定固定形参。
+
 ### 导入预设
 
 仓库根目录的 `presets.json` 就是给直接使用的：含 1062 个人物预设 + 60 条画风预设。市场安装的插件目录是 `plugins/packages/novelai`（手动 clone 则是 `nekro_plugin_novelai`），复制到插件数据目录：

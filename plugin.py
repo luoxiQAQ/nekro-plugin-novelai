@@ -41,7 +41,7 @@ _plugin_kwargs: dict = dict(
     name="NovelAI 画图",
     module_name="novelai",
     description="NovelAI 文生图/图生图/精准参考插件，支持 NAI v3/v4/v4.5/v5 模型。",
-    version="1.8.8",
+    version="1.8.9",
     author="luoxi",
     url="",
     i18n_name=i18n.i18n_text(zh_CN="NovelAI 画图", en_US="NovelAI Image"),
@@ -1885,6 +1885,46 @@ _current_command_message: ContextVar[Optional[Any]] = ContextVar(
 )
 
 
+def _command_call_context(original: Any, args: tuple, kwargs: dict) -> Dict[str, Any]:
+    """从 collector._try_handle_command 的实参里还原命令上下文。
+
+    上游各版本的签名并不统一（2.3.x 是 5 个参数，2.4.x 在 chat_key 之后新增了
+    platform_channel，变成 6 个），所以不绑定固定形参：优先按参数名绑定，
+    绑定不上再按位置兜底，保证新旧版本都能取到上下文。
+    """
+    arguments: Dict[str, Any] = dict(kwargs)
+    try:
+        arguments.update(_inspect.signature(original).bind(*args, **kwargs).arguments)
+    except (TypeError, ValueError) as exc:
+        logger.debug(f"命令上下文补丁无法解析 _try_handle_command 签名，改用位置兜底: {exc}")
+
+    chat_key = arguments.get("chat_key")
+    platform_user = arguments.get("platform_user")
+    platform_message = arguments.get("platform_message")
+    content_text = arguments.get("content_text")
+
+    if chat_key is None and len(args) > 1:
+        chat_key = args[1]
+    if platform_message is None or platform_user is None:
+        # 位置兜底：无论 5 参还是 6 参，尾参恒为 (platform_user, platform_message, content_text)
+        tail = list(args)
+        if tail and isinstance(tail[-1], str):
+            tail.pop()
+        if platform_message is None and tail:
+            platform_message = tail[-1]
+        if platform_user is None and len(tail) >= 2:
+            platform_user = tail[-2]
+    if content_text is None:
+        content_text = getattr(platform_message, "content_text", "") if platform_message is not None else ""
+
+    return {
+        "chat_key": chat_key or "",
+        "user_id": getattr(platform_user, "user_id", ""),
+        "platform_message": platform_message,
+        "content_text": content_text or "",
+    }
+
+
 def _install_command_message_context_patch() -> None:
     """让命令处理函数能拿到触发命令的原始 platform_message。"""
     try:
@@ -1899,15 +1939,18 @@ def _install_command_message_context_patch() -> None:
     if getattr(original, "__novelai_ctx_wrapped__", False):
         original = getattr(original, "__novelai_ctx_original__", original)
 
-    async def _wrapped_try_handle_command(adapter, chat_key, platform_channel, platform_user, platform_message, content_text):
-        token = _current_command_message.set({
-            "chat_key": chat_key,
-            "user_id": getattr(platform_user, "user_id", ""),
-            "platform_message": platform_message,
-            "content_text": content_text,
-        })
+    async def _wrapped_try_handle_command(*args, **kwargs):
+        # 不绑定固定形参：2.3.x 传 5 个位置参数、2.4.x 传 6 个（多 platform_channel），
+        # 也可能有关键字传参；一律原样透传给上游，只旁路记录上下文，避免签名不匹配
+        # 抛 TypeError 打断整个消息收集流程。
         try:
-            return await original(adapter, chat_key, platform_channel, platform_user, platform_message, content_text)
+            context = _command_call_context(original, args, kwargs)
+        except Exception as exc:
+            logger.debug(f"命令上下文补丁提取参数失败（不影响命令执行）: {exc}")
+            context = None
+        token = _current_command_message.set(context)
+        try:
+            return await original(*args, **kwargs)
         finally:
             _current_command_message.reset(token)
 
@@ -2024,12 +2067,22 @@ def _install_message_cache_patch() -> None:
     if getattr(original, "__novelai_cache_wrapped__", False):
         original = getattr(original, "__novelai_cache_original__", original)
 
-    async def _wrapped_collect_message(adapter, platform_channel, platform_user, platform_message):
+    async def _wrapped_collect_message(*args, **kwargs):
+        # 同样不绑定固定形参，只旁路缓存图片，签名差异不会打断上游消息收集。
+        arguments: Dict[str, Any] = dict(kwargs)
         try:
-            _cache_recent_images(adapter.build_chat_key(platform_channel.channel_id), platform_message)
+            arguments.update(_inspect.signature(original).bind(*args, **kwargs).arguments)
+        except (TypeError, ValueError):
+            pass
+        adapter = arguments.get("adapter")
+        platform_channel = arguments.get("platform_channel")
+        platform_message = arguments.get("platform_message")
+        try:
+            if adapter is not None and platform_channel is not None and platform_message is not None:
+                _cache_recent_images(adapter.build_chat_key(platform_channel.channel_id), platform_message)
         except Exception as exc:
             logger.debug(f"缓存消息图片失败: {exc}")
-        return await original(adapter, platform_channel, platform_user, platform_message)
+        return await original(*args, **kwargs)
 
     setattr(_wrapped_collect_message, "__novelai_cache_wrapped__", True)
     setattr(_wrapped_collect_message, "__novelai_cache_original__", original)
